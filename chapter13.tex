@@ -1,0 +1,797 @@
+% ============================================================================
+%  chapter13.tex
+%  Advanced Memory Management and Custom Allocators
+% ============================================================================
+
+\chapter{Advanced Memory Management and Custom Allocators}
+
+\section{The Problem malloc Solves}
+
+Every data structure in Chapter~4 asked \code{malloc} for bytes, and
+Chapter~1 taught us to check the result. But \code{malloc} is not a
+language feature; it is a \emph{program}---an allocator---that runs
+inside your process, and its behavior decides the performance and
+fragmentation of everything you build. This chapter opens that black
+box: how allocators work, why memory fragments, and how to write your
+own allocators when the defaults are the wrong shape for your workload.
+
+The two extremes of allocation, drawn before we go anywhere:
+
+\begin{verbatim}
+   From the kernel's point of view (ch.12):          From your program's view:
+
+   the heap is pages the kernel hands you.           the heap is a pool of
+                                                     variable-size chunks you
+     heap:  [ page ][ page ][ page ][ page ]        request and release:
+                                                     malloc(12) -> a 12-byte
+   malloc() gets a page when it needs more,          chunk, then free() it.
+   free() returns memory to the allocator,           The allocator sits in
+   only rarely back to the kernel.                   between, juggling the
+                                                     chunks inside the pages.
+\end{verbatim}
+
+The allocator's contract is simple and brutal: \emph{given an
+arbitrary sequence of malloc and free calls, satisfy every request,
+reuse freed memory when possible, waste as little as possible, and do
+it fast}. Getting all four right simultaneously is impossible in the
+worst case; every allocator is a set of bets about how programs
+behave.
+
+\begin{osconcept}
+The kernel provides memory only in pages, and only at the granularity
+of whole pages. Individual small allocations would be absurdly wasteful
+if each were its own page, so the OS delegates the juggling to a
+user-space allocator inside your process. That is why \code{malloc}
+is a library, not a syscall---it is an OS-adjacent program built on
+the kernel's page grants, and its design is where the OS and the
+application meet.
+\end{osconcept}
+
+\section{Free Lists and the Split/Merge Dance}
+
+The heart of every general allocator is the \emph{free list}: a linked
+list of unused chunks, threaded through the freed memory itself. When
+you \code{free} a chunk, it is added to the list. When you
+\code{malloc}, the allocator searches the list for a chunk big enough,
+\emph{splits} it if it is larger than needed, and removes the piece
+you get. When a chunk's neighbors are also free, the allocator
+\emph{merges} them back into one bigger chunk---the only defense
+against fragmentation.
+
+\begin{verbatim}
+   The free list, drawn as linked memory:
+
+     heap:  [ A ][ F1 ][ B ][ F2 ][ C ]
+                ^      ^
+                |      +-- free chunks threaded through the heap
+
+     free list:  F1 --> F2 --> NULL
+                 (each free chunk stores the next free chunk's address
+                  INSIDE its own space -- free memory is exactly the
+                  space you can afford to use for bookkeeping)
+
+   malloc(20) from F1 (size 48):
+     - is F1 big enough? yes
+     - split:  F1.used = 20 bytes for you; F1.tail = 28 bytes, freed
+     - return the 20-byte chunk; the 28-byte remainder rejoins the list
+
+   free(your chunk): add it to the list; if its neighbors are free,
+     MERGE them, because 28 + 20 + 16 adjacent beats three scattered
+     chunks of any smaller size.
+\end{verbatim}
+
+The split/merge cycle is the allocator's entire life. Its difficulty
+is that the two operations fight each other: splitting creates small
+fragments, and only merging heals them, but merging only works on
+\emph{adjacent} freed chunks, and adjacency is not something you can
+control after the fact.
+
+\begin{lstlisting}[caption={A minimal free-list allocator, on a static arena.}]
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
+
+/* The arena: one big byte buffer the allocator hands out from. */
+#define ARENA_SIZE 65536
+static unsigned char arena[ARENA_SIZE];
+
+/* Each chunk starts with a header describing it. The header lives in
+   the arena, right before the user's bytes.                        */
+typedef struct chunk {
+    size_t size;          /* user-visible size in bytes */
+    int free;             /* 1 if free, 0 if allocated */
+    struct chunk *next;   /* next chunk in the arena (not the free list) */
+} chunk;
+
+#define HEADER_SIZE (sizeof(chunk))
+
+/* The first chunk in the arena. Built lazily on first use. */
+static chunk *arena_head = NULL;
+
+static void arena_init(void) {
+    chunk *c;
+
+    /* One chunk covering the whole arena, free. */
+    c = (chunk *) arena;
+    c->size = ARENA_SIZE - HEADER_SIZE;
+    c->free = 1;
+    c->next = NULL;
+    arena_head = c;
+}
+
+void *my_malloc(size_t size) {
+    chunk *cur;
+
+    if (arena_head == NULL) {
+        arena_init();
+    }
+
+    /* Round the request up to at least a header, and to alignment. */
+    if (size < 16) {
+        size = 16;
+    }
+    size = (size + 7) & ~(size_t) 7;
+
+    /* First-fit search: the first free chunk big enough wins. */
+    cur = arena_head;
+    while (cur != NULL) {
+        if (cur->free && cur->size >= size) {
+            break;
+        }
+        cur = cur->next;
+    }
+    if (cur == NULL) {
+        return NULL;        /* no room */
+    }
+
+    /* Split: if the leftover is big enough to be useful, do it. */
+    if (cur->size >= size + HEADER_SIZE + 8) {
+        chunk *tail;
+
+        tail = (chunk *) ((unsigned char *) (cur + 1) + size);
+        tail->size = cur->size - size - HEADER_SIZE;
+        tail->free = 1;
+        tail->next = cur->next;
+        cur->next = tail;
+
+        cur->size = size;
+    }
+
+    cur->free = 0;
+    return (void *) (cur + 1);
+}
+
+void my_free(void *p) {
+    chunk *c;
+
+    if (p == NULL) {
+        return;
+    }
+    c = (chunk *) p - 1;     /* the header lives just before the user bytes */
+    c->free = 1;
+
+    /* Coalesce with the NEXT chunk if it is free. */
+    if (c->next != NULL && c->next->free) {
+        c->size = c->size + HEADER_SIZE + c->next->size;
+        c->next = c->next->next;
+    }
+}
+
+void *my_calloc(size_t n, size_t size) {
+    void *p;
+
+    p = my_malloc(n * size);
+    if (p != NULL) {
+        memset(p, 0, n * size);
+    }
+    return p;
+}
+\end{lstlisting}
+
+Study the shape of this code, because it is the template for every
+allocator in this chapter: a header per chunk, first-fit search,
+split on allocation, coalesce-on-next on free. Two details are
+deliberate: the header lives \emph{immediately before} the user's
+bytes, so \code{my\_free} finds it with \code{(chunk *) p - 1}; and
+the coalescing only merges with the \emph{next} chunk, because walking
+backward would need a doubly linked structure or a separate metadata
+area.
+
+\begin{verbatim}
+   The memory layout my_malloc produces:
+
+     +-------+--------------------------+-------+-------------+
+     | hdr A |  your 20 bytes           | hdr B | 28 free     |
+     +-------+--------------------------+-------+-------------+
+       ^ cur+1 returned                  ^ header of the remainder
+
+   free(p) finds header A (p - 1), marks it free, and merges it with
+   B if B is free -- so a later malloc(40) can use A+B together.
+\end{verbatim}
+
+\begin{osconcept}
+The free list is a user-space data structure, but it rests on a kernel
+fact: the heap is pages you were granted, and the allocator decides
+how to divide them. The kernel cannot merge your fragments, because it
+sees only pages, not your chunks. Splitting, merging, and searching
+are therefore application-level problems---the OS hands out the clay,
+and the allocator sculpts it.
+\end{osconcept}
+
+\section{Fragmentation: The Silent Tax}
+
+Why do long-running programs grow forever even when they free
+everything? The answer is \emph{fragmentation}, and it comes in two
+kinds:
+
+\begin{verbatim}
+   INTERNAL fragmentation: you asked for bytes, you got a bigger
+   chunk, and the difference is wasted.
+
+     malloc(12)  ->  chunk of 16 (the allocator rounds up):
+                     +--------+-------------+
+                     | header | 16 bytes    |  4 bytes never used
+                     +--------+-------------+
+                     internal waste = 4 bytes, invisible to you.
+
+   EXTERNAL fragmentation: free bytes exist, but they are in
+   scattered pieces, none big enough for a request.
+
+     heap after a long life:
+     [ X ][ F 8 ][ X ][ F 8 ][ X ][ F 8 ][ X ][ F 8 ]
+       ^   ^----^   ^      ^      ^      ^
+       used  free   used   free   used   free   32 bytes free TOTAL,
+       chunks of 8: no single 16-byte request can be satisfied.
+
+   External fragmentation is the killer. It is why a process can have
+   100 MB free and still fail a 1 MB malloc.
+\end{verbatim}
+
+The classic demonstration is the \emph{allocator stone soup}: allocate
+many chunks, free every other one, then try to allocate one big chunk.
+The bytes are all there; they are just not adjacent.
+
+\begin{verbatim}
+   A, B, C, D allocated.   Free B and D.   malloc(big):
+
+     [A][  F  ][C][  F  ]        free = 2 x 10 bytes, separated
+       10 free    10 free        big request of 22: FAILS even though
+                                 20 bytes are free, because no single
+                                 stretch reaches 22.
+
+   The allocator's only weapon is COALESCING on free (merge adjacent
+   neighbors), and even that cannot heal a checkerboard pattern where
+   no two free chunks touch.
+\end{verbatim}
+
+\textbf{Concept} -- the \emph{binary buddy} allocator attacks external
+fragmentation structurally. It divides memory into powers of two:
+a request is rounded up to the next power of two, the arena is split
+in half recursively to make that size, and frees merge only with their
+\emph{buddy}---the adjacent half of the same parent. Because every
+chunk has exactly one buddy of its own size, merging is guaranteed to
+recover full parent blocks, and the free list becomes a set of
+power-of-two lists with \code{O(1)} insertion.
+
+\begin{lstlisting}[caption={The buddy allocator: powers of two, buddy merge.}]
+#include <stdio.h>
+#include <stdlib.h>
+
+/* Sizes tracked: 2^min .. 2^max, stored as lists of free blocks. */
+#define MIN_ORDER 4     /* smallest block: 16 bytes  */
+#define MAX_ORDER 12    /* largest block:  4096 bytes */
+#define MIN_SIZE  (1 << MIN_ORDER)
+
+typedef struct block {
+    struct block *next;
+} block;
+
+static block *free_lists[MAX_ORDER + 1];
+
+/* A block's buddy is its neighbor of the same size within the parent. */
+static void *buddy_of(void *addr, int order) {
+    size_t size;
+
+    size = (size_t) 1 << order;
+    return (void *) (((size_t) addr) ^ size);
+}
+
+/* Return the largest power-of-two order that fits size. */
+static int order_for(size_t size) {
+    int order;
+
+    size = size - 1;
+    order = MIN_ORDER;
+    while ((size >> order) != 0) {
+        order = order + 1;
+    }
+    return order;
+}
+
+void *buddy_malloc(size_t size) {
+    int order;
+    int i;
+    block *b;
+    void *p;
+
+    order = order_for(size);
+    if (order > MAX_ORDER) {
+        return NULL;
+    }
+
+    /* Find the smallest free list at or above this order. */
+    for (i = order; i <= MAX_ORDER; i++) {
+        if (free_lists[i] != NULL) {
+            break;
+        }
+    }
+    if (i > MAX_ORDER) {
+        return NULL;     /* nothing big enough exists */
+    }
+
+    /* Take the block and split it downward to the right size. */
+    b = free_lists[i];
+    free_lists[i] = b->next;
+
+    while (i > order) {
+        size_t half;
+
+        half = (size_t) 1 << (i - 1);
+        p = (void *) ((size_t) b + half);      /* the buddy half */
+        ((block *) p)->next = free_lists[i - 1];
+        free_lists[i - 1] = (block *) p;       /* free the buddy */
+        i = i - 1;
+    }
+
+    return b;
+}
+
+void buddy_free(void *addr, int order) {
+    void *buddy;
+    block *b;
+
+    b = (block *) addr;
+    while (order < MAX_ORDER) {
+        buddy = buddy_of(addr, order);
+        /* If the buddy is on our free list, merge: remove it, double. */
+        if (free_lists[order] == buddy) {
+            free_lists[order] = free_lists[order]->next;
+            if (addr < buddy) {
+                b = (block *) addr;
+            } else {
+                b = (block *) buddy;
+            }
+            addr = b;
+            order = order + 1;
+        } else {
+            break;
+        }
+    }
+
+    b->next = free_lists[order];
+    free_lists[order] = b;
+}
+\end{lstlisting}
+
+\begin{verbatim}
+   The buddy split, drawn:
+
+     arena of 4096 (order 12):
+     [             4096            ]          free_lists[12]
+            |  malloc(1500) -> order_for(1500) = 11 (2048)
+            v
+     [     2048       ][   2048 free   ]      free_lists[11]
+       ^ you get this ^ the buddy is freed, can be re-split later
+
+     when you free the 2048, its buddy is checked: if both free, the
+     pair merges back into one 4096 -- automatically, because the
+     buddy is always exactly adjacent and exactly the same size.
+\end{verbatim}
+
+The beauty is the property that makes buddy systems attractive in
+operating systems themselves: \emph{merging never has to search}. A
+block either has its buddy free (merge, guaranteed adjacent) or not
+(split again later). No coalescing pass, no walking. The cost is
+internal fragmentation---rounding to powers of two can waste nearly
+half a block---which is why real kernels tune the order range and use
+other allocators for small objects.
+
+\begin{osconcept}
+Fragmentation is the allocator's fundamental adversary, and the kernel
+feels its effects at a larger scale: a process that fragments its heap
+into holes may still need the OS to grant \emph{new} pages, inflating
+its footprint. Buddy systems exist because the kernel itself must
+allocate physical pages and merge them back, and it wants merging to
+be cheap and structural---powers of two make ``is my neighbor free''
+a single XOR. Fragmentation is an OS problem because it is a physical
+reality of paged memory, not just a library concern.
+\end{osconcept}
+
+\section{Arenas and Object Pools}
+
+The general allocator is flexible and fragmented. The \emph{arena}
+(also called a \emph{region} or \emph{pool}) is the opposite bet:
+allocate a big block, hand out pieces by bumping a pointer, and free
+\emph{everything at once}. It is the right answer when allocations
+share a lifetime---a request's scratch space, a connection's
+buffers, a frame of a game.
+
+\begin{verbatim}
+   Arena allocator: a pointer that only moves forward.
+
+     arena:  [ used ][ used ][ used ][             free          ]
+                    ^                          ^
+               bump pointer             arena + arena_size
+
+     malloc(n): align n, copy the bump pointer out, advance it.
+     free:      NOTHING. There is no individual free.
+     reset:     set the bump pointer back to the start; the whole
+                arena is free again in one instruction.
+
+   The deal: individual frees are impossible; whole-life resets are
+   free. Perfect when every allocation in a phase lives as long as
+   the phase.
+\end{verbatim}
+
+\begin{lstlisting}[caption={arena.c: an arena allocator.}]
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+
+typedef struct arena {
+    unsigned char *mem;      /* the whole block              */
+    size_t cap;              /* total capacity in bytes      */
+    size_t off;              /* bytes handed out so far      */
+} arena;
+
+void arena_init(arena *a, size_t cap) {
+    a->mem = malloc(cap);
+    if (a->mem == NULL) {
+        exit(1);
+    }
+    a->cap = cap;
+    a->off = 0;
+}
+
+void *arena_alloc(arena *a, size_t size) {
+    void *p;
+
+    /* Align to 8 bytes so any type can live there. */
+    size = (size + 7) & ~(size_t) 7;
+
+    if (a->off + size > a->cap) {
+        return NULL;         /* arena exhausted */
+    }
+    p = a->mem + a->off;
+    a->off = a->off + size;
+    return p;
+}
+
+/* Free the ENTIRE arena in one step: rewind the bump pointer. */
+void arena_reset(arena *a) {
+    a->off = 0;
+}
+
+void arena_destroy(arena *a) {
+    free(a->mem);
+    a->mem = NULL;
+    a->cap = 0;
+    a->off = 0;
+}
+
+int main(void) {
+    arena a;
+    char *s1;
+    char *s2;
+
+    arena_init(&a, 4096);
+
+    s1 = arena_alloc(&a, 32);
+    s2 = arena_alloc(&a, 64);
+    if (s1 == NULL || s2 == NULL) {
+        fprintf(stderr, "arena exhausted\n");
+        return 1;
+    }
+
+    arena_reset(&a);          /* both s1 and s2 are gone at once */
+
+    arena_destroy(&a);
+    return 0;
+}
+\end{lstlisting}
+
+\begin{verbatim}
+   Arena vs malloc at a glance:
+
+                     arena              malloc
+   alloc cost        a few ops          search free lists
+   free individual   not supported      supported
+   free everything   one reset          one call per chunk
+   fragmentation     none (linear)      external fragmentation
+   best for          same-lifetime      unknown lifetimes,
+                     batches            general use
+\end{verbatim}
+
+\textbf{Concept} -- an \emph{object pool} is the third classic: instead
+of variable sizes, a pool handles objects of \emph{one fixed size}
+(threads, connections, nodes). Allocation pops from a free list;
+free pushes back. Nothing is ever handed to the OS or fragmented,
+because every object is interchangeable and exactly one size.
+
+\begin{lstlisting}[caption={An object pool: fixed-size objects, no fragmentation.}]
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+
+#define POOL_OBJS 64
+#define OBJ_SIZE  32
+
+typedef struct pool_obj {
+    struct pool_obj *next;   /* free list threaded through free objs */
+    unsigned char pad[OBJ_SIZE - sizeof(struct pool_obj *)];
+} pool_obj;
+
+typedef struct pool {
+    pool_obj *free_head;     /* next free object */
+    pool_obj storage[POOL_OBJS];
+} pool;
+
+void pool_init(pool *p) {
+    size_t i;
+
+    for (i = 0; i < POOL_OBJS; i++) {
+        p->storage[i].next = p->free_head;
+        p->free_head = &p->storage[i];
+    }
+}
+
+void *pool_alloc(pool *p) {
+    pool_obj *o;
+
+    o = p->free_head;
+    if (o == NULL) {
+        return NULL;         /* pool exhausted */
+    }
+    p->free_head = o->next;
+    return (void *) o;
+}
+
+void pool_free(pool *p, void *ptr) {
+    pool_obj *o;
+
+    o = (pool_obj *) ptr;
+    o->next = p->free_head;      /* push back on the free list */
+    p->free_head = o;
+}
+\end{lstlisting}
+
+\begin{verbatim}
+   The pool's memory, drawn:
+
+     pool.storage:  [o0][o1][o2]...[o63]    one fixed-size array
+
+     free list threads through FREE objects only:
+       free_head -> o5 -> o2 -> o31 -> NULL
+
+     alloc: pop head; free: push head. O(1), zero searches, zero
+     fragmentation, zero system calls. The pool is the data
+     structure of the data structure.
+\end{verbatim}
+
+\begin{osconcept}
+Arena and pool allocators exploit the kernel's own strategy: hand out
+large regions rarely, subdivide them locally, and reclaim wholesale.
+The kernel grants pages; the arena bumps a pointer through them; the
+pool never asks the kernel again. Choosing the allocator is choosing
+how often your program crosses the kernel boundary---and good
+allocator design is simply the discipline of crossing it as rarely as
+possible.
+\end{osconcept}
+
+\section{Practical: A Connection Pool for a Server}
+
+Let us apply the chapter to the book's own recurring hero---the
+server. A connection pool hands out fixed-size connection objects,
+reuses them across clients, and never fragments and never calls
+\code{malloc} after startup. This is the object pool of the previous
+section wearing its production costume.
+
+\begin{lstlisting}[caption={connpool.c: fixed-size connection objects, recycled.}]
+#include <stdio.h>
+#include <stdlib.h>
+
+typedef struct conn {
+    int fd;                /* the socket (0 = free slot)   */
+    int in_use;            /* 1 while a client owns it     */
+    struct conn *next;     /* free-list threading           */
+} conn;
+
+typedef struct conn_pool {
+    conn *slots;           /* the fixed array of conns      */
+    int capacity;
+    conn *free_head;       /* head of the free list         */
+} conn_pool;
+
+int conn_pool_init(conn_pool *p, int capacity) {
+    int i;
+
+    p->slots = malloc(sizeof(conn) * (size_t) capacity);
+    if (p->slots == NULL) {
+        return -1;
+    }
+    p->capacity = capacity;
+    p->free_head = NULL;
+
+    /* Thread every slot onto the free list. */
+    for (i = 0; i < capacity; i++) {
+        p->slots[i].fd = 0;
+        p->slots[i].in_use = 0;
+        p->slots[i].next = p->free_head;
+        p->free_head = &p->slots[i];
+    }
+    return 0;
+}
+
+/* Hand out a free connection object, or NULL if the pool is full. */
+conn *conn_pool_acquire(conn_pool *p) {
+    conn *c;
+
+    c = p->free_head;
+    if (c == NULL) {
+        return NULL;
+    }
+    p->free_head = c->next;
+    c->in_use = 1;
+    return c;
+}
+
+/* Return a connection to the pool. */
+void conn_pool_release(conn_pool *p, conn *c) {
+    c->in_use = 0;
+    c->fd = 0;
+    c->next = p->free_head;
+    p->free_head = c;
+}
+
+int main(void) {
+    conn_pool pool;
+    conn *c1;
+    conn *c2;
+
+    if (conn_pool_init(&pool, 8) < 0) {
+        return 1;
+    }
+
+    c1 = conn_pool_acquire(&pool);
+    c2 = conn_pool_acquire(&pool);
+    if (c1 == NULL || c2 == NULL) {
+        fprintf(stderr, "pool exhausted\n");
+        return 1;
+    }
+    printf("acquired two connections\n");
+
+    conn_pool_release(&pool, c1);
+    conn_pool_release(&pool, c2);
+
+    /* Reacquire the same objects -- same addresses, no malloc. */
+    c1 = conn_pool_acquire(&pool);
+    printf("reacquired (pool recycles storage)\n");
+    conn_pool_release(&pool, c1);
+
+    free(pool.slots);
+    return 0;
+}
+\end{lstlisting}
+
+\begin{verbatim}
+   Why a pool and not malloc per connection:
+
+     malloc/free per connection   pool
+     -------------------------    ----
+     searches free lists          O(1) pop/push
+     can fragment over a day      zero fragmentation (fixed size)
+     may cross the kernel         no syscalls after init
+     allocator lock contention    single-threaded pop/push (or one
+                                   lock for the pool)
+     allocator can't recycle      addresses recycle: caches stay warm
+
+   The price: a fixed maximum (capacity) and objects that cannot
+   outlive the pool. Both are features when you know your limits.
+\end{verbatim}
+
+\begin{researchnote}[The measured case for custom allocators]
+Chapter~1 introduced the empirical study by Berger, Zorn, and
+McKinley that most custom allocators do not beat \code{malloc}. Now
+that you can read their argument in context, the nuance matters: they
+found that allocators win when they \emph{specialize to a workload's
+lifetime patterns}---exactly what arenas and pools do here---and lose
+when they merely reimplement a general allocator slightly differently.
+
+\begin{verbatim}
+   The paper's real conclusion, restated honestly:
+
+       "Generic custom allocators rarely help; allocators that match
+        a program's allocation AND deallocation patterns -- regions,
+        pools, per-thread caches -- are the ones that show gains."
+
+   This chapter is that sentence in practice: the arena (reset in
+   O(1)), the pool (fixed size, no fragmentation), and the buddy
+   (structural merge) are lifetime-aware designs. A hand-rolled
+   malloc-lookalike is the one approach the research says to skip.
+\end{verbatim}
+
+So the research note from Chapter~1 and this chapter agree: write
+\emph{specialized} allocators when your workload has structure, not
+generic ones on a whim. Measure first; the paper's methodology (link
+in many allocators, time them) is the correct one to steal.
+
+\paperref{E.~D.~Berger, B.~G.~Zorn, K.~S.~McKinley, ``Reconsidering
+Custom Memory Allocation,'' ACM OOPSLA 2002}{https://people.cs.umass.edu/~emery/pubs/berger-oopsla2002.pdf}
+\end{researchnote}
+
+\section{Structures in Bytes}
+
+Every allocator in this chapter hides a header in front of the bytes
+you receive. On a 64-bit machine the structures are:
+
+\begin{verbatim}
+   my_malloc chunk header  24 bytes   offset size field
+                                      0      8    size   (user size)
+                                      8      4    free
+                                      12     4    pad
+                                      16     8    next   (next in arena)
+   arena                   24 bytes   0      8    mem
+                                      8      8    cap
+                                      16     8    off
+   pool_obj                32 bytes   0      8    next   (free-list link)
+                                      8      24   pad[24]
+   buddy free block         8 bytes   0      8    next   (threaded inside)
+\end{verbatim}
+
+The header sits immediately before the user's bytes, so
+\code{my\_free} recovers it with \code{(chunk *) p - 1}; because the
+header is 24 bytes and the sizes are rounded to 8, every user pointer
+is 8-byte aligned. The arena is a bump pointer plus a capacity, 24
+bytes total; the pool is one array of fixed-size objects whose free
+list is threaded through the objects themselves. These byte counts are
+the whole point: an allocator is a small set of byte records and the
+rules for moving them.
+
+\section{Summary}
+
+\begin{verbatim}
+   The allocator toolbox, complete:
+
+   free list        freed chunks threaded through memory
+   first-fit        the simplest search; split on alloc
+   coalescing       merge adjacent frees (the anti-fragmentation cure)
+   internal frag    waste inside your own chunk (rounding)
+   external frag    free bytes in pieces too small to use
+   buddy system     powers of two; buddy merge is O(1)
+   arena            bump pointer, reset everything at once
+   object pool      one fixed size, O(1) pop/push, no frag
+
+   Rules that keep allocator code correct:
+     1. every alloc returns NULL or a valid pointer -- check it;
+     2. a header is reachable from the user pointer (p - 1);
+     3. coalesce with the NEXT chunk on free, at minimum;
+     4. match the allocator to the LIFETIME pattern, not to a mood;
+     5. measure before you write one; the default is usually fine.
+\end{verbatim}
+
+\begin{osconcept}
+Allocators are where the application and the OS shake hands: the
+kernel grants pages, the allocator divides them, and fragmentation
+wanders back up the chain as wasted pages. Every allocator in this
+chapter is a different answer to the same kernel-shaped question--
+how rarely can I ask for more?--and the best ones ask almost never.
+This is the deepest layer of memory management before we leave the
+heap for good.
+\end{osconcept}
+
+With memory mastered, the next chapter switches from bytes to
+\emph{symbols}: parsing text with state machines, the technique that
+powers every config parser, every protocol decoder, and every
+compiler's front end.
+

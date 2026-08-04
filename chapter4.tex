@@ -1,0 +1,2422 @@
+% ============================================================================
+%  chapter4.tex
+%  Data Structures and Algorithms in C (The Mega Chapter)
+% ============================================================================
+
+\chapter{Data Structures and Algorithms in C}
+
+\section{Welcome to the Menagerie}
+
+Everything in the previous chapters was preparation for a single
+realization: \emph{a data structure is a disciplined web of pointers}. A
+linked list is a struct pointing at a struct. A tree is a struct with
+two or more pointers to structs. A graph is an array of lists of
+structs. A hash table is an array of pointers to structs, chosen by
+hashing. There is nothing else under the hood---only structs, pointers,
+and the ownership rules we insisted upon.
+
+This chapter is the biggest in the book, and deliberately so. We
+implement, draw, and dissect the entire family of structures a systems
+programmer reaches for daily. For each one we answer the same four
+questions, the ones that settle every design:
+
+\begin{verbatim}
+   1. SHAPE  : what does the struct look like?       (draw it)
+   2. COST   : what do search/insert/delete cost?    (O(...))
+   3. OWNER  : who allocates, who frees?             (write it down)
+   4. CACHE  : how do the bytes sit in memory?       (think about it)
+\end{verbatim}
+
+The code follows the house style without exception: pointers move on
+their own lines, \code{size\_t} is reserved for loop counters, every
+\code{malloc} is checked, and every diagram is drawn before any code is
+trusted.
+
+\section{Linked Lists}
+
+\subsection{The Singly Linked List}
+
+The singly linked list is the first structure, the seed from which the
+others grow. A node holds a value and one pointer: the address of the
+next node.
+
+\begin{lstlisting}[caption={The singly linked node.}]
+typedef struct node {
+    int value;
+    struct node *next;
+} node;
+\end{lstlisting}
+
+\begin{verbatim}
+   head
+    |
+    v
+   +-------+      +-------+      +-------+
+   | val=3 |      | val=7 |      | val=1 |
+   | next -----> | next -----> | next -----> NULL
+   +-------+      +-------+      +-------+
+
+   - The list is named by the single pointer "head".
+   - Every "next" is an arrow to the following node.
+   - The final "next" is NULL: the arrow that points at nothing.
+   - You may only walk FORWARD; to reach node k you must pass through
+     nodes 0..k-1, one dereference at a time.
+\end{verbatim}
+
+Push at the front is the operation we already know from Chapter~3: it
+rewrites the caller's \code{head} through a pointer-to-pointer.
+
+\begin{lstlisting}[caption={Push at the front. Returns 1 on success.}]
+int list_push_front(node **head, int value) {
+    node *new_node;
+
+    new_node = malloc(sizeof(node));
+    if (new_node == NULL) {
+        return 0;
+    }
+    new_node->value = value;
+    new_node->next = *head;
+    *head = new_node;
+    return 1;
+}
+\end{lstlisting}
+
+Singly lists reward one trick above all others: keeping the address of
+the \emph{link} you are interested in, rather than the node. Inserting
+in sorted order and deleting both collapse to the same pattern---walk a
+\code{node **} and splice.
+
+\begin{lstlisting}[caption={Insert keeping the list sorted ascending.}]
+int list_insert_sorted(node **head, int value) {
+    node *new_node;
+    node **cur;
+
+    new_node = malloc(sizeof(node));
+    if (new_node == NULL) {
+        return 0;
+    }
+    new_node->value = value;
+    new_node->next = NULL;
+
+    /* cur is the ADDRESS of a "next" link, not the address of a node.
+       It walks until the first node whose value is >= value.        */
+    cur = head;
+    while (*cur != NULL && (*cur)->value < value) {
+        cur = &(*cur)->next;
+    }
+
+    /* Splice: the new node points at the node cur names, and the
+       link cur names now points at the new node.                  */
+    new_node->next = *cur;
+    *cur = new_node;
+
+    return 1;
+}
+\end{lstlisting}
+
+\begin{verbatim}
+   Insert 5 into  3 -> 7 -> NULL
+
+   head
+    |
+    v
+   +-------+      +-------+
+   | val=3 |      | val=7 |
+   | next -----> | next -----> NULL
+   +-------+      +-------+
+
+   cur begins as &head (an address OF A POINTER).
+     step 1: *cur = 3-node, 3 < 5, so cur = &(3-node.next)
+     step 2: *cur = 7-node, 7 not < 5, stop
+
+   Now:
+     new_node->next = *cur;   (new node -> 7-node)
+     *cur = new_node;         (3-node.next -> new node)
+
+   head
+    |
+    v
+   +-------+      +-------+      +-------+
+   | val=3 |      | val=5 |      | val=7 |
+   | next -----> | next -----> | next -----> NULL
+   +-------+      +-------+      +-------+
+
+   Removing a node uses the same trick, and never needs a special case
+   for "removing the head".
+\end{verbatim}
+
+\begin{lstlisting}[caption={Remove the first node holding value.}]
+int list_remove(node **head, int value) {
+    node **cur;
+    node *victim;
+
+    cur = head;
+    while (*cur != NULL && (*cur)->value != value) {
+        cur = &(*cur)->next;
+    }
+
+    if (*cur == NULL) {
+        return 0;              /* not present */
+    }
+
+    victim = *cur;
+    *cur = victim->next;       /* the predecessor now skips victim */
+    free(victim);
+    return 1;
+}
+\end{lstlisting}
+
+Reading \code{list\_remove}: because \code{cur} is an address of a
+link, unlinking is one assignment. If the victim was the head,
+\code{cur} is \code{\&head} and \code{*cur} updates the caller's head
+directly. No branch, no special case, no bug.
+
+\begin{verbatim}
+   Removing the 7-node from  3 -> 7 -> 9 -> NULL:
+
+   BEFORE                                  AFTER
+   +-------+   +-------+   +-------+       +-------+   +-------+
+   | val=3 |   | val=7 |   | val=9 |       | val=3 |   | val=9 |
+   | next ----->| next ----->| next --->   | next ----->| next --->
+   +-------+   +-------+   +-------+       +-------+   +-------+
+                 ^ victim
+
+   *cur (which is 3-node.next) is set to victim->next (the 9-node).
+   Then free(victim). The 7-node is gone; the chain is unbroken.
+\end{verbatim}
+
+Traversal and destruction are the loops we saw in Chapter~3: walk with
+\code{cur = cur->next}, and in \code{free\_all} save the successor
+before freeing. Search is the same walk returning the matching node, or
+\code{NULL}.
+
+\begin{insight}[Why we keep the link address, not the node]
+The singly linked list has only forward arrows. To delete a node you
+must be able to reach the arrow that points at it---the \emph{previous}
+node's \code{next}. Rather than tracking the previous node in a second
+variable, we walk a pointer \emph{to} the link itself. \code{node **}
+is not advanced; it is exactly the right precision: it is the address
+of the arrow.
+\end{insight}
+
+\subsection{The Doubly Linked List}
+
+Add a second pointer to each node and you can walk both ways, delete a
+node in \code{O(1)} given its address, and insert before a node without
+searching. The cost is one extra pointer per node.
+
+\begin{lstlisting}[caption={The doubly linked node.}]
+typedef struct dnode {
+    int value;
+    struct dnode *prev;
+    struct dnode *next;
+} dnode;
+\end{lstlisting}
+
+\begin{verbatim}
+   head
+    |
+    v
+   +--------+      +--------+      +--------+
+   | prev=NULL |   | prev=3 |       | prev=7 |
+   |  value=3 |   | value=7 |       | value=9 |
+   | next=7 ----+  | next=9 ----+   | next=NULL |
+   +--------+  |  +--------+  |    +--------+
+        ^       +----->|       +----->|
+        |               |               |
+        +----(the prev arrows)----------+
+
+   Two chains of arrows: "next" runs forward, "prev" runs backward.
+   head->next is the first node; head->prev is NULL (or the tail, in
+   the circular variant below).
+\end{verbatim}
+
+Inserting after a given node touches four arrows. Do them in an order
+that never reads a node you are about to unlink.
+
+\begin{lstlisting}[caption={Insert a new node right after node at.}]
+int dlist_insert_after(dnode *at, int value) {
+    dnode *new_node;
+
+    new_node = malloc(sizeof(dnode));
+    if (new_node == NULL) {
+        return 0;
+    }
+    new_node->value = value;
+
+    /* Wire the new node into the gap. */
+    new_node->prev = at;
+    new_node->next = at->next;
+
+    /* Repair the node that used to follow "at". */
+    if (at->next != NULL) {
+        at->next->prev = new_node;
+    }
+    at->next = new_node;
+
+    return 1;
+}
+\end{lstlisting}
+
+\begin{verbatim}
+   Inserting value=5 right after the 7-node.  BEFORE and AFTER:
+
+   BEFORE:                          AFTER:
+   +------+   +------+   +------+  +------+   +------+   +------+   +------+
+   | val=3|   | val=7 |   | val=9|  | val=3|   | val=7 |   | val=5|   | val=9|
+   | prev |<->| prev  |<->| prev |  | prev |<->| prev  |<->| prev |<->| prev |
+   | next |   | next  |   | next |  | next |   | next  |   | next |   | next |
+   +------+   +------+   +------+  +------+   +------+   +------+   +------+
+                  ^ at                            ^ at
+
+   The new node (value=5) is spliced in between 7 and 9.
+\end{verbatim}
+
+Deleting a node given only its address is the doubly linked list's
+signature advantage:
+
+\begin{lstlisting}[caption={Delete a node in O(1), given its address.}]
+void dlist_remove(dnode *victim) {
+    /* Repair the left neighbor, if any. */
+    if (victim->prev != NULL) {
+        victim->prev->next = victim->next;
+    }
+    /* Repair the right neighbor, if any. */
+    if (victim->next != NULL) {
+        victim->next->prev = victim->prev;
+    }
+    free(victim);
+}
+\end{lstlisting}
+
+No search is needed: the victim itself carries the arrows to its two
+neighbors, and each neighbor points back at the victim. Two assignments
+unlink it. This is why hash-table buckets, LRU caches, and memory
+allocators all use doubly linked lists internally.
+
+\subsection{The Circular Linked List}
+
+Make the tail point back at the head instead of at \code{NULL}, and the
+list becomes a ring. With a single \code{tail} pointer, both push-front
+and push-back are \code{O(1)}, and a walk never ends---which is exactly
+what a round-robin scheduler wants.
+
+\begin{lstlisting}[caption={The circular node is just a node; the ring is a convention.}]
+typedef struct cnode {
+    int value;
+    struct cnode *next;
+} cnode;
+\end{lstlisting}
+
+\begin{verbatim}
+   A circular list. The last node's next points back at the first.
+
+   tail
+    |
+    v
+   +-------+      +-------+      +-------+
+   | val=1 |      | val=3 |      | val=7 |
+   | next -----> | next -----> | next --+
+   +-------+      +-------+      +-------+
+       ^                             |
+       +-----------------------------+
+
+   - tail->next is the first node (O(1) "front").
+   - tail itself is the last node (O(1) "back").
+   - Walking: cur = cur->next revisits 1 after 7, forever.
+
+   Round-robin across 3 processes:
+     process 1 runs, then 2, then 3, then back to 1...
+     cur = cur->next;  -- a single pointer, a single step.
+\end{verbatim}
+
+Inserting at the front of a circular list is the singly linked push
+plus one extra fix-up to keep the ring closed.
+
+\begin{lstlisting}[caption={Push at the front of a circular list.}]
+int clist_push_front(cnode **tail, int value) {
+    cnode *new_node;
+
+    new_node = malloc(sizeof(cnode));
+    if (new_node == NULL) {
+        return 0;
+    }
+    new_node->value = value;
+
+    if (*tail == NULL) {
+        /* First node: the ring is just itself. */
+        new_node->next = new_node;
+        *tail = new_node;
+        return 1;
+    }
+
+    new_node->next = (*tail)->next;   /* new node points at the old first */
+    (*tail)->next = new_node;         /* tail still points at the last    */
+    return 1;
+}
+\end{lstlisting}
+
+\begin{verbatim}
+   Why "tail" and not "head"? With a tail pointer:
+
+     front = tail->next     O(1)
+     back  = tail           O(1)
+
+   With only a head pointer, finding the last node to push at the back
+   would require walking the whole ring. The tail pointer buys O(1) on
+   both ends at the cost of one field.
+\end{verbatim}
+
+\begin{insight}[The sentinel head]
+The empty ring is the only case that needs care. Our push handles it
+with an explicit \code{if (*tail == NULL)}. An alternative that
+eliminates the branch entirely is a permanent \emph{sentinel} node that
+is never data---the ring always exists, and ``empty'' means the
+sentinel points at itself. Linux kernel lists (next subsection) are
+built exactly this way, so that the empty list and the non-empty list
+are the same code path.
+\end{insight}
+
+\subsection{The Intrusive Linked List}
+
+Every list so far owned its data: the node \emph{was} the value. The
+\emph{intrusive} list inverts this: your data structure contains the
+links. Instead of \code{struct node \{ int value; node *next; \}}, you
+embed a generic \code{list\_head} inside your own struct, and the list
+machinery manipulates only the embedded links. The data structure never
+knows what its elements are---it owns no \code{malloc}, it frees
+nothing, it just arranges arrows.
+
+\begin{lstlisting}[caption={The generic link: no data, just arrows.}]
+typedef struct list_head {
+    struct list_head *next;
+    struct list_head *prev;
+} list_head;
+\end{lstlisting}
+
+\begin{lstlisting}[caption={A struct that carries a link inside it.}]
+typedef struct process {
+    int pid;
+    int priority;
+    list_head links;     /* the intrusive hook: the list arranges this */
+} process;
+\end{lstlisting}
+
+\begin{verbatim}
+   Intrusive list: the chain is made of list_head fields EMBEDDED in
+   the processes.
+
+   +----------------+---------------+
+   | process { pid = 1000, prio 3 } |
+   |   links.next --+               |
+   |   links.prev <-- NULL          |
+   +----------------+---------------+
+                    |   (next: down, prev: up)
+                    v
+   +----------------+---------------+
+   | process { pid = 1001, prio 1 } |
+   |   links.next --+               |
+   |   links.prev <-+               |
+   +----------------+---------------+
+                    |
+                    v
+   +----------------+---------------+
+   | process { pid = 1002, prio 5 } |
+   |   links.next --> NULL          |
+   |   links.prev <-+               |
+   +----------------+---------------+
+
+   The list code sees only the links; it never knows pid exists.
+   Given a pointer to a link, the process is recovered by arithmetic:
+
+       process *p = (process *) ((char *) link_ptr - offsetof(process, links));
+\end{verbatim}
+
+That last step, going from a member pointer back to the containing
+struct, is the entire trick, and the Linux kernel gives it a name:
+\code{container\_of}. It is just pointer subtraction with
+\code{offsetof}.
+
+\begin{lstlisting}[caption={container\_of: from a member back to its container.}]
+#include <stddef.h>
+
+/* Given a pointer to a member inside a struct, return the struct. */
+#define container_of(ptr, type, member) \
+    ((type *) ((char *) (ptr) - offsetof(type, member)))
+\end{lstlisting}
+
+The list operations are uniform and tiny. We use a permanent sentinel
+\code{head} that forms a ring with itself when empty, which removes
+every ``empty list'' special case.
+
+\begin{lstlisting}[caption={Circular intrusive list with a sentinel head.}]
+/* A head is a link too; it never carries data. */
+void list_init(list_head *head) {
+    head->next = head;
+    head->prev = head;
+}
+
+/* Insert a new link between prev and next. */
+static void list_add_between(list_head *new_node, list_head *prev,
+                             list_head *next) {
+    next->prev = new_node;
+    new_node->next = next;
+    new_node->prev = prev;
+    prev->next = new_node;
+}
+
+/* Insert at the front of the list headed by head. */
+void list_push_front(list_head *head, list_head *new_node) {
+    list_add_between(new_node, head, head->next);
+}
+
+/* Unlink a link from its list. */
+void list_remove(list_head *entry) {
+    entry->prev->next = entry->next;
+    entry->next->prev = entry->prev;
+    entry->next = entry;   /* leave the link self-contained (safe) */
+    entry->prev = entry;
+}
+
+/* Walk the list; on each pass you recover the container with container_of. */
+#define list_for_each(pos, head) \
+    for (pos = (head)->next; pos != (head); pos = pos->next)
+\end{lstlisting}
+
+\begin{verbatim}
+   The sentinel head forms the ring:
+
+   empty:  head.next = head, head.prev = head
+
+            +-------+
+            | head  |<-+
+            | next--|--+
+            | prev--|--+
+            +-------+
+
+   after pushing two processes: head sits between the front and the
+   back, and the ring is closed through it. Walking stops when you
+   return to the sentinel, not at NULL.
+
+   Why intrusive?  Because the list is FREE: no allocation per element,
+   no node ownership, and an element can belong to several lists at
+   once (e.g. one "all processes" list and one "ready queue"). The cost
+   is that container_of is your responsibility, and that an element
+   cannot outlive its containers.
+\end{verbatim}
+
+\begin{insight}[Why Linux uses intrusive lists everywhere]
+A kernel may have millions of tasks, and each task can sit in several
+lists simultaneously. An intrusive list adds zero allocations and zero
+per-element nodes, and the link is wherever you put it. This is the
+same philosophy behind \code{container\_of}: ownership and layout
+belong to the user, the list only arranges arrows.
+\end{insight}
+
+\subsection{The Unrolled Linked List}
+
+A plain linked list scatters one small node per element across the
+heap, and each \code{next} dereference may miss the cache. An
+\emph{unrolled} list trades a little insertion work for locality: each
+node holds a small \emph{array} of values plus one \code{next} pointer,
+so a walk visits many elements per node and per cache line.
+
+\begin{lstlisting}[caption={The unrolled node: a block plus one arrow.}]
+#define BLOCK_CAP 4
+
+typedef struct unrolled_node {
+    int count;                 /* how many slots are currently live */
+    int data[BLOCK_CAP];       /* the fixed-size block              */
+    struct unrolled_node *next;
+} unrolled_node;
+\end{lstlisting}
+
+\begin{verbatim}
+   An unrolled list holding 1,2,3,4,5,6:
+
+   +-----------------------------------------------+
+   | count=4 | 1 | 2 | 3 | 4 | next ----------+    |
+   +-----------------------------------------------+ |
+   +-----------------------------------------------+ |
+   | count=2 | 5 | 6 | _ | _ | next -> NULL     |<--+
+   +-----------------------------------------------+
+
+   - Four elements arrive in ONE node: one allocation, one cache line
+     (or two), four dereferences avoided.
+   - A block that fills to capacity is SPLIT into two half-full blocks.
+   - Deletion can MERGE adjacent half-empty blocks to stay dense.
+\end{verbatim}
+
+Insertion walks to the right block, then either places the value in a
+free slot or splits the block first.
+
+\begin{lstlisting}[caption={Insert at a 0-based index, splitting when full.}]
+int ulist_insert(unrolled_node **head, int index, int value) {
+    unrolled_node *cur;
+    unrolled_node *block;
+    size_t pos;
+    size_t i;
+
+    if (*head == NULL) {
+        block = malloc(sizeof(unrolled_node));
+        if (block == NULL) {
+            return 0;
+        }
+        block->count = 0;
+        block->next = NULL;
+        *head = block;
+    }
+
+    /* Advance to the block containing position "index". */
+    cur = *head;
+    pos = (size_t) index;
+    while (cur->next != NULL && pos > (size_t) cur->count) {
+        pos = pos - (size_t) cur->count;
+        cur = cur->next;
+    }
+
+    /* A full block is split: move the upper half to a fresh block. */
+    if (cur->count == BLOCK_CAP) {
+        block = malloc(sizeof(unrolled_node));
+        if (block == NULL) {
+            return 0;
+        }
+        block->count = BLOCK_CAP / 2;
+        for (i = 0; i < (size_t) block->count; i++) {
+            block->data[i] = cur->data[BLOCK_CAP / 2 + i];
+        }
+        block->next = cur->next;
+        cur->next = block;
+        cur->count = BLOCK_CAP / 2;
+
+        /* The insert belongs to the new block if it passed the middle. */
+        if (pos > (size_t) cur->count) {
+            pos = pos - (size_t) cur->count;
+            cur = block;
+        }
+    }
+
+    /* Shift the block's tail right by one, then store the value. */
+    for (i = cur->count; i > pos; i--) {
+        cur->data[i] = cur->data[i - 1];
+    }
+    cur->data[pos] = value;
+    cur->count = cur->count + 1;
+
+    return 1;
+}
+\end{lstlisting}
+
+\begin{verbatim}
+   Inserting 9 into the middle of a full block:
+
+   BEFORE                                AFTER SPLIT + INSERT
+   +---------------------------+         +---------------------------+
+   | count=4 | 1 | 2 | 3 | 4 |          | count=2 | 1 | 2 |   |   | ---> block
+   +---------------------------+         +---------------------------+
+                                           count=3 | 9 | 3 | 4 |   |
+                                         (new block holds the tail)
+
+   The block no longer has to move when the list grows a bit more;
+   locality is preserved at the cost of O(block) shifting per insert.
+\end{verbatim}
+
+The unrolled list shines for queues and work-stealing stacks where
+traversal dominates, and it is the ancestor of the \emph{block} idea
+inside B-trees (Section~4.6). It also demonstrates the Loop Counter
+Rule in a shift loop where the counter must count \emph{down} without
+underflowing: \code{for (i = cur->count; i > pos; i--)} stops at
+\code{i == pos}, never below.
+
+\subsection{The XOR Linked List}
+
+A doubly linked list stores two pointers per node. The \emph{XOR
+list} stores one integer: the XOR of the addresses of its two
+neighbors. From one neighbor and the stored value you always recover
+the other, because \code{(a \^{} b) \^{} a == b}.
+
+\begin{lstlisting}[caption={The XOR node: one integer, two neighbors recovered.}]
+#include <stdint.h>
+
+typedef struct xor_node {
+    int value;
+    uintptr_t link;   /* prev XOR next, stored as an unsigned address */
+} xor_node;
+\end{lstlisting}
+
+\begin{verbatim}
+   head ----> [3] ----> [7] ----> [9] ----> NULL
+
+   stored in each node:
+     node(3).link = NULL  ^ node(7)     = node(7)
+     node(7).link = node(3) ^ node(9)
+     node(9).link = node(7) ^ NULL      = node(7)
+
+   walking forward you know the previous node, so:
+     next = node.link  XOR  prev
+
+   walking backward you know the next node, so:
+     prev = node.link  XOR  next
+
+   It is a doubly linked list with a single pointer per node.
+\end{verbatim}
+
+Insertion at the front must repair the old head's link, and every walk
+must carry the predecessor explicitly.
+
+\begin{lstlisting}[caption={Push at the front of an XOR list.}]
+xor_node *xlist_push_front(xor_node *head, int value) {
+    xor_node *new_node;
+
+    new_node = malloc(sizeof(xor_node));
+    if (new_node == NULL) {
+        return NULL;
+    }
+    new_node->value = value;
+
+    /* new_node->link must be: prev(NULL) XOR next(head) = head. */
+    new_node->link = (uintptr_t) head;
+
+    /* The old head's link was (0 XOR its_next); it becomes
+       (its_next XOR new_node), so that its_next is still recoverable. */
+    if (head != NULL) {
+        head->link = head->link ^ (uintptr_t) new_node;
+    }
+
+    return new_node;
+}
+\end{lstlisting}
+
+\begin{lstlisting}[caption={Walk forward, remembering the predecessor.}]
+void xlist_print(const xor_node *head) {
+    const xor_node *cur;
+    const xor_node *prev;
+    const xor_node *next;
+    uintptr_t stored;
+
+    prev = NULL;
+    cur = head;
+    while (cur != NULL) {
+        printf("%d ", cur->value);
+
+        stored = cur->link;
+        next = (const xor_node *) (stored ^ (uintptr_t) prev);
+
+        prev = cur;
+        cur = next;
+    }
+    printf("\n");
+}
+\end{lstlisting}
+
+\begin{verbatim}
+   The walk keeps TWO pointers alive: the current node and the one
+   before it. From those two, the next node is arithmetic, not a
+   dereference:
+
+     state:   prev        cur         (stored link)      next
+              NULL        [3]         node(7)     -->    [7]
+              [3]         [7]         3^9         -->    [9]
+              [7]         [9]         node(7)     -->    NULL
+\end{verbatim}
+
+\begin{ruleofthumb}[XOR lists are a curiosity, use them sparingly]
+The XOR list saves one pointer per node, and pays for it in three ways:
+the walk always needs the neighbor (you cannot jump into the middle of
+a list and walk from there); casting pointers to \code{uintptr\_t} and
+back is implementation-defined, so the trick is not portable to every
+platform; and it is incompatible with garbage collectors and with any
+form of bounds checking that inspects pointer provenance. Admire it,
+understand the arithmetic, then prefer a conventional doubly linked
+list in production code.
+\end{ruleofthumb}
+
+\section{The Skip List}
+
+The skip list is the structure that made Salvatore Sanfilippo's
+Redis famous as a sorted-set implementation, and it deserves its
+reputation. It is a stack of linked lists: the bottom level holds every
+element, and each higher level holds a random subset, spaced widely
+enough that searches leap over large ranges and land near their target
+in \code{O(log n)} expected time.
+
+\begin{verbatim}
+   A skip list over 3,9,12,17,21,25. Towers run vertically.
+
+   level 4:  head ----------------------------------------> NULL
+   level 3:  head ----------------------> 17 ------------> NULL
+   level 2:  head ---------> 9 --------> 17 ------------> NULL
+   level 1:  head --> 3 ---> 9 --------> 17 ---> 21 ---> NULL
+   level 0:  head --> 3 --> 9 --> 12 --> 17 --> 21 --> 25 -> NULL
+
+   Searching for 21, starting at the head's highest level:
+     level 4:  next is NULL,            drop down
+     level 3:  17 < 21  move; NULL,     drop down
+     level 2:  17 < 21  move; NULL,     drop down
+     level 1:  21 found in 2 hops here; overall ~4 hops instead of 6.
+
+   The expected search length is O(log n): each level cuts the space
+   by a constant factor, exactly like the levels of a balanced tree--
+   but a skip list is a SORTED SET built from linked lists, with no
+   rotations and no rebalancing passes.
+\end{verbatim}
+
+A node carries an array of forward pointers; its height is chosen
+randomly, so tall nodes are rare. We build the node with the flexible
+array member from Chapter~3.
+
+\begin{lstlisting}[caption={The skip list structures.}]
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define SKIP_MAX_LEVEL 16
+#define SKIP_P          4   /* 1/P probability of one more level */
+
+typedef struct skiplist_node {
+    int value;
+    int level;                        /* how many forward links this node has */
+    struct skiplist_node *forward[];  /* forward[0..level-1]                 */
+} skiplist_node;
+
+typedef struct skiplist {
+    skiplist_node *head;   /* tower of SKIP_MAX_LEVEL forward links */
+    int level;             /* highest level currently in use        */
+    int size;              /* number of elements                    */
+} skiplist;
+
+/* Random tower height: geometric with expectation 1/(1-1/P). */
+static int random_level(void) {
+    int level;
+
+    level = 1;
+    while ((rand() % SKIP_P) == 0 && level < SKIP_MAX_LEVEL) {
+        level = level + 1;
+    }
+    return level;
+}
+
+void skiplist_init(skiplist *sl) {
+    int i;
+
+    sl->head = malloc(sizeof(skiplist_node) +
+                      (size_t) SKIP_MAX_LEVEL * sizeof(skiplist_node *));
+    if (sl->head == NULL) {
+        exit(1);
+    }
+    for (i = 0; i < SKIP_MAX_LEVEL; i++) {
+        sl->head->forward[i] = NULL;
+    }
+    sl->head->level = SKIP_MAX_LEVEL;
+    sl->level = 1;
+    sl->size = 0;
+}
+\end{lstlisting}
+
+Search first, because insert and delete reuse its shape: descend level
+by level, each time advancing as far right as possible without
+overshooting.
+
+\begin{lstlisting}[caption={Search: leap down and to the right.}]
+/* Returns 1 if value is present. */
+int skiplist_search(const skiplist *sl, int value) {
+    const skiplist_node *cur;
+    size_t i;
+
+    cur = sl->head;
+    for (i = sl->level; i > 0; i--) {
+        while (cur->forward[i - 1] != NULL &&
+               cur->forward[i - 1]->value < value) {
+            cur = cur->forward[i - 1];
+        }
+    }
+
+    /* After the top-down descent, the answer is the next node at level 0. */
+    cur = cur->forward[0];
+    if (cur != NULL && cur->value == value) {
+        return 1;
+    }
+    return 0;
+}
+\end{lstlisting}
+
+Notice the down-counting loop written safely: the \code{size\_t} counter
+\code{i} counts \emph{down to 1}, never to 0, and the actual level
+index is \code{i - 1}. The loop counter never underflows.
+
+Insertion records, for each level, the last node visited before the
+insertion point; those nodes' forward links are exactly where the new
+tower must be spliced.
+
+\begin{lstlisting}[caption={Insert: record the update path, then splice the tower.}]
+/* Insert value. Returns 1 on success, 0 on allocation failure. */
+int skiplist_insert(skiplist *sl, int value) {
+    skiplist_node *update[SKIP_MAX_LEVEL];
+    skiplist_node *cur;
+    skiplist_node *new_node;
+    size_t i;
+    int new_level;
+
+    /* Descend, remembering the last node at each level. */
+    cur = sl->head;
+    for (i = sl->level; i > 0; i--) {
+        while (cur->forward[i - 1] != NULL &&
+               cur->forward[i - 1]->value < value) {
+            cur = cur->forward[i - 1];
+        }
+        update[i - 1] = cur;
+    }
+
+    /* Choose the tower height; extend the head if we got taller. */
+    new_level = random_level();
+    if (new_level > sl->level) {
+        for (i = sl->level; i < (size_t) new_level; i++) {
+            update[i] = sl->head;
+        }
+        sl->level = new_level;
+    }
+
+    new_node = malloc(sizeof(skiplist_node) +
+                      (size_t) new_level * sizeof(skiplist_node *));
+    if (new_node == NULL) {
+        return 0;
+    }
+    new_node->value = value;
+    new_node->level = new_level;
+
+    /* Splice the new node into each level of the update path. */
+    for (i = 0; i < (size_t) new_level; i++) {
+        new_node->forward[i] = update[i]->forward[i];
+        update[i]->forward[i] = new_node;
+    }
+
+    sl->size = sl->size + 1;
+    return 1;
+}
+\end{lstlisting}
+
+\begin{verbatim}
+   Inserting 10 into the list drawn above, with a 2-tall tower:
+
+   level 2:  update[2] = head      level 2:  head -------------------> 17 -> ...
+                                             ^
+                                             |new
+   level 1:  update[1] = 9         level 1:  head --> 9 ---> [10] ---> 17 -> ...
+   level 0:  update[0] = 9         level 0:  head -> 3 -> 9 -> [10] -> 12 -> ...
+
+   update[k] is the node whose forward[k] must point at the new node.
+   After splicing, 10 is reachable at every level of its own tower.
+\end{verbatim}
+
+Deletion is the mirror image: record the update path, and for each
+level of the victim's tower, route \code{update[i]->forward[i]} around
+the victim; then free it.
+
+\begin{verbatim}
+   The skip list completes the "all the lists" tour:
+
+   structure       search     insert   delete    memory/node
+   singly          O(n)       O(1)+    O(n)      1 pointer
+   doubly          O(n)       O(1)+    O(1)+     2 pointers
+   circular        O(n)       O(1)+    O(1)+     ring
+   intrusive       O(n)       O(1)+    O(1)+     embedded, free
+   unrolled        O(n)       O(n)     O(n)      block of values
+   XOR             O(n)       O(1)+    O(1)+     1 pointer, needs neighbor
+   skip list       O(log n)*  O(log n)* O(log n)* towers (probabilistic)
+   * expected, and with the same code for sorted ranges.
+\end{verbatim}
+
+\begin{insight}[Lists beat arrays for one thing: stable pointers]
+An array moves its elements on insert and delete; a list does not. The
+skip list keeps that property and adds logarithmic search. That is why
+Redis implements sorted sets with skip lists rather than balanced
+trees: the code is dramatically simpler, the pointers stay stable, and
+the expected performance matches. When you must keep addresses valid
+while sorting and searching, reach for a skip list.
+\end{insight}
+
+\begin{researchnote}[The skip list's origin]
+The skip list was invented by William Pugh in 1990, and its original
+paper is worth reading because it makes the central claim of this
+section explicit: a sorted structure built from linked lists can match
+a balanced tree's guarantees without the tree's machinery.
+
+\begin{verbatim}
+   An extract from the paper's abstract:
+
+       "Skip lists are a probabilistic data structure that seem likely
+        to supplant balanced trees as the implementation method of
+        choice for many applications, since skip lists are
+        substantially simpler to implement than balanced trees, and
+        provide expected search time proportional to log n."
+
+   In plain terms: "probabilistic" means the towers are chosen by
+   coin flips rather than by enforcing a strict balance invariant;
+   "expected search time proportional to log n" is the same bound a
+   balanced tree guarantees, but the skip list achieves it with far
+   less bookkeeping.
+\end{verbatim}
+
+The practical payoff is visible in this book's own example: Redis, a
+production database serving billions of operations, uses exactly this
+structure for sorted sets. A data structure invented in a research
+paper is not a classroom curiosity; it is running in production all
+around you.
+
+\paperref{W.~Pugh, ``Skip Lists: A Probabilistic Alternative to Balanced
+Trees,'' Communications of the ACM 33(6), 1990}{https://15721.courses.cs.cmu.edu/spring2018/papers/08-oltpindexes1/pugh-skiplists-cacm1990.pdf}
+\end{researchnote}
+
+\section{Hash Tables}
+
+A hash table trades a function for a search. Instead of comparing a key
+against every stored key, we compute a number from the key---the
+\emph{hash}---reduce it modulo the table size to get a \emph{bucket
+index}, and go straight there. Perfect hashing would give
+\code{O(1)}. Reality gives \code{O(1)} expected, provided we handle
+collisions (two different keys hashing to the same bucket) and keep the
+table from filling up.
+
+\begin{verbatim}
+   The core idea:
+
+      key "abc" --hash--> 281872  --mod 8-->  bucket 0
+      key "xyz" --hash--> 450817  --mod 8-->  bucket 1
+      key "ghi" --hash--> 226514  --mod 8-->  bucket 2
+
+      buckets
+        +------+------+------+------+------+------+------+------+
+        | [0]  | [1]  | [2]  | [3]  | [4]  | [5]  | [6]  | [7]  |
+        +------+------+------+------+------+------+------+------+
+         key     key    key
+         "abc"   "xyz"  "ghi"
+
+   Two keys with the same bucket collide; the two major collision
+   strategies are the two subsections below.
+\end{verbatim}
+
+The hash function must be fast, must spread keys evenly, and must be
+\emph{deterministic}. The classic djb2 reads a string and mixes it with
+\code{h = h * 33 + c}.
+
+\begin{lstlisting}[caption={djb2: a simple, proven string hash.}]
+static unsigned int hash_str(const char *s) {
+    unsigned int h;
+    int c;
+
+    h = 5381;
+    c = (unsigned char) *s;
+    while (c != 0) {
+        h = (h * 33) + (unsigned int) c;
+        s = s + 1;
+        c = (unsigned char) *s;
+    }
+    return h;
+}
+\end{lstlisting}
+
+Note the cast of each character to \code{unsigned char}: \code{char}
+may be signed, and negative bytes would otherwise corrupt the mix.
+The multiplication by 33 and the accumulation spread the bits across
+the whole word, which is what turns similar keys into dissimilar
+bucket indexes.
+
+\subsection{Separate Chaining}
+
+Separate chaining makes each bucket a small linked list. A collision is
+not an error; it just makes the bucket's chain one node longer. The
+whole table is an array of chain heads.
+
+\begin{lstlisting}[caption={A chained hash table.}]
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct ht_node {
+    char *key;                /* owned copy of the key */
+    int   value;
+    struct ht_node *next;     /* next node in this bucket */
+} ht_node;
+
+typedef struct hashtable {
+    ht_node **buckets;        /* array of chain heads */
+    int nbuckets;             /* current number of buckets */
+    int used;                 /* number of live entries   */
+} hashtable;
+\end{lstlisting}
+
+\begin{verbatim}
+   buckets is an array of pointers; each pointer is the head of a chain.
+
+        +------+      +------+      +------+      +------+
+        | [0]  |      | [1]  |      | [2]  |      | [3]  |
+        +------+      +------+      +------+      +------+
+          |              |             |             |
+          v              v             v             v
+        +-------+      +-------+     +-------+     +-------+
+        | "abc" |      | "ghi" |     | "def" |     | "xyz" |
+        | 42    |      | 7     |     | 99    |     | 13    |
+        | next -->NULL | next -->NULL | next -->NULL | next -->NULL
+        +-------+      +-------+     +-------+     +-------+
+        +-------+
+        | "zzz" |      <-- "zzz" collided with "ghi": the chain grows
+        | 1     |
+        | next -->NULL
+        +-------+
+
+   A collision simply lengthens a chain. Load factor = used/nbuckets;
+   chains average exactly the load factor.
+\end{verbatim}
+
+Lookup walks the bucket's chain comparing with \code{strcmp}; update
+replaces a value when the key is found; otherwise a new node is pushed
+onto the chain.
+
+\begin{lstlisting}[caption={Insert or update. Returns 1 on success.}]
+int ht_set(hashtable *ht, const char *key, int value) {
+    unsigned int idx;
+    ht_node *cur;
+    ht_node *new_node;
+
+    idx = hash_str(key) % (unsigned int) ht->nbuckets;
+
+    /* Update in place if the key already exists in its bucket. */
+    cur = ht->buckets[idx];
+    while (cur != NULL) {
+        if (strcmp(cur->key, key) == 0) {
+            cur->value = value;
+            return 1;
+        }
+        cur = cur->next;
+    }
+
+    /* Not present: allocate a node and its owned key copy. */
+    new_node = malloc(sizeof(ht_node));
+    if (new_node == NULL) {
+        return 0;
+    }
+    new_node->key = strdup(key);
+    if (new_node->key == NULL) {
+        free(new_node);
+        return 0;
+    }
+    new_node->value = value;
+
+    new_node->next = ht->buckets[idx];
+    ht->buckets[idx] = new_node;
+
+    ht->used = ht->used + 1;
+    return 1;
+}
+\end{lstlisting}
+
+\begin{lstlisting}[caption={Lookup. Returns 1 and sets *out when found.}]
+int ht_get(const hashtable *ht, const char *key, int *out) {
+    unsigned int idx;
+    const ht_node *cur;
+
+    idx = hash_str(key) % (unsigned int) ht->nbuckets;
+
+    cur = ht->buckets[idx];
+    while (cur != NULL) {
+        if (strcmp(cur->key, key) == 0) {
+            *out = cur->value;
+            return 1;
+        }
+        cur = cur->next;
+    }
+    return 0;
+}
+\end{lstlisting}
+
+The killer detail in \code{ht\_set}: the key is \emph{copied} with
+\code{strdup}, so the table owns the key for its whole life and the
+caller may reuse or free the original buffer. Ownership is explicit on
+both sides. The destroy function then frees every node and every owned
+key copy.
+
+When the load factor climbs (say past 0.75), we \emph{grow} the table:
+allocate a new, larger bucket array and rehash every live node into it.
+Rehashing matters---\code{idx} depends on \code{nbuckets}, so the old
+bucket number is meaningless in the new array.
+
+\begin{lstlisting}[caption={Grow the table and rehash every node.}]
+static int ht_resize(hashtable *ht, int new_count) {
+    ht_node **old_buckets;
+    ht_node **new_buckets;
+    ht_node *cur;
+    ht_node *next;
+    unsigned int idx;
+    size_t i;
+
+    new_buckets = calloc((size_t) new_count, sizeof(ht_node *));
+    if (new_buckets == NULL) {
+        return 0;
+    }
+
+    old_buckets = ht->buckets;
+    for (i = 0; i < (size_t) ht->nbuckets; i++) {
+        cur = old_buckets[i];
+        while (cur != NULL) {
+            next = cur->next;                /* save before relinking */
+
+            idx = hash_str(cur->key) % (unsigned int) new_count;
+            cur->next = new_buckets[idx];    /* rehang into the new table */
+            new_buckets[idx] = cur;
+
+            cur = next;
+        }
+    }
+
+    free(old_buckets);
+    ht->buckets = new_buckets;
+    ht->nbuckets = new_count;
+    return 1;
+}
+\end{lstlisting}
+
+Because the nodes themselves are reused---only their \code{next}
+pointers are rewired---the resize is a cheap pointer shuffle, not a
+reallocation of every key.
+
+\begin{ruleofthumb}[Keep the load factor bounded]
+Chaining degrades gracefully, but long chains defeat the \code{O(1)}
+promise. Grow when \code{used / nbuckets} exceeds roughly 0.75. The
+resize doubles the array, so the amortized cost of growth is a
+constant per insert---the same argument that pays for dynamic arrays.
+\end{ruleofthumb}
+
+\subsection{Open Addressing}
+
+Open addressing keeps all entries \emph{inside} the array itself:
+no chains, no per-node allocations, better cache locality. A collision
+is resolved by \emph{probing} forward to the next free slot. The
+simplest probe is \emph{linear}: try slot \code{i}, then \code{i+1},
+then \code{i+2}, wrapping around the end of the array.
+
+\begin{lstlisting}[caption={An open-addressing table with linear probing.}]
+typedef enum slot_state {
+    SLOT_EMPTY,       /* never used: the search can stop here */
+    SLOT_USED,        /* holds a live key */
+    SLOT_TOMBSTONE    /* was used, then deleted: search continues */
+} slot_state;
+
+typedef struct oa_table {
+    char       **keys;
+    int        *values;
+    slot_state *states;
+    int        capacity;
+    int        used;
+} oa_table;
+\end{lstlisting}
+
+\begin{verbatim}
+   capacity = 8.  hash("abc")%8 = 3, hash("xyz")%8 = 4, hash("ghi")%8 = 5,
+   hash("def")%8 = 3  (collides with "abc").
+
+   Insert in order: "abc", "xyz", "ghi", "def".
+
+   slot:  0        1        2        3        4        5        6        7
+        +--------+--------+--------+--------+--------+--------+--------+--------+
+        | EMPTY  | EMPTY  | EMPTY  | "abc"  | "xyz"  | "ghi"  | "def"  | EMPTY  |
+        |        |        |        |  42    |   7    |   1    |  99    |        |
+        +--------+--------+--------+--------+--------+--------+--------+--------+
+
+   "def" wanted slot 3, found it full, probed 4, full, 5, full, 6, empty.
+   Linear probing turns collisions into a short run of nearby probes.
+   Deletion leaves a TOMBSTONE so later searches keep walking past the
+   hole instead of stopping at a false "not found".
+\end{verbatim}
+
+Insertion probes forward, stopping at the first empty or tombstone
+slot; if it finds the key already present, it updates instead.
+
+\begin{lstlisting}[caption={Insert with linear probing. Returns 1 on success.}]
+int oa_set(oa_table *t, const char *key, int value) {
+    unsigned int idx;
+    size_t i;
+    int slot;
+
+    idx = hash_str(key) % (unsigned int) t->capacity;
+
+    for (i = 0; i < (size_t) t->capacity; i++) {
+        slot = (int) ((idx + (unsigned int) i) % (unsigned int) t->capacity);
+
+        if (t->states[slot] == SLOT_EMPTY ||
+            t->states[slot] == SLOT_TOMBSTONE) {
+            /* Free slot: the probe stops here. */
+            if (t->keys[slot] != NULL) {
+                free(t->keys[slot]);
+            }
+            t->keys[slot] = strdup(key);
+            if (t->keys[slot] == NULL) {
+                return 0;
+            }
+            t->values[slot] = value;
+            t->states[slot] = SLOT_USED;
+            t->used = t->used + 1;
+            return 1;
+        }
+
+        if (t->states[slot] == SLOT_USED && strcmp(t->keys[slot], key) == 0) {
+            t->values[slot] = value;      /* update an existing key */
+            return 1;
+        }
+    }
+
+    return 0;   /* table full */
+}
+\end{lstlisting}
+
+Lookup must probe exactly the same way, and it must not stop at a
+tombstone---the key it seeks may be past it. It stops only at an empty
+slot, which is the proof the key is absent.
+
+\begin{lstlisting}[caption={Lookup with the same probe sequence.}]
+int oa_get(const oa_table *t, const char *key, int *out) {
+    unsigned int idx;
+    size_t i;
+    int slot;
+
+    idx = hash_str(key) % (unsigned int) t->capacity;
+
+    for (i = 0; i < (size_t) t->capacity; i++) {
+        slot = (int) ((idx + (unsigned int) i) % (unsigned int) t->capacity);
+
+        if (t->states[slot] == SLOT_EMPTY) {
+            return 0;        /* the key is definitely not present */
+        }
+        if (t->states[slot] == SLOT_USED && strcmp(t->keys[slot], key) == 0) {
+            *out = t->values[slot];
+            return 1;
+        }
+    }
+
+    return 0;
+}
+\end{lstlisting}
+
+\begin{verbatim}
+   Looking up "def" (hash %8 = 3):
+
+     slot 3: USED "abc"  -- not a match, keep probing
+     slot 4: USED "xyz"  -- not a match
+     slot 5: USED "ghi"  -- not a match
+     slot 6: USED "def"  -- match! return 99
+
+   Looking up "qrs" (hash %8 = 3):
+
+     slot 3..5: used, no match
+     slot 6:    USED "def", no match
+     slot 7:    EMPTY  -- stop. "qrs" is absent. We cannot skip slot 7;
+     if we stopped at the first non-EMPTY we would report "absent" for
+     keys that live further right. That is why tombstones exist.
+\end{verbatim}
+
+\begin{ruleofthumb}[Open addressing must stay loose]
+Probing chains merge into clusters as the table fills, and long
+clusters make every lookup slower. Keep the load factor below about
+0.7, grow by reinserting all entries into a doubled array, and clear
+tombstones on resize so they stop accumulating. Clustering is the
+reason variants such as quadratic probing and double hashing exist:
+they spread probes so clusters do not form.
+\end{ruleofthumb}
+
+\begin{verbatim}
+   chaining vs open addressing:
+
+   concern            separate chaining        open addressing
+   ----------------   --------------------     ----------------------
+   memory             nodes + bucket array     one flat array
+   allocation         one per insert           none during insert
+   locality           poor (chains scatter)    excellent (same array)
+   deletion           free the node            tombstone + cleanup
+   safe load factor   up to ~1.0               must stay < 0.7
+   worst case         long chain               cluster / full table
+   best for           generic, unknown keys    hot, cache-bound tables
+\end{verbatim}
+
+\begin{researchnote}[Collision handling has been studied since 1956]
+The choice between collision strategies---our chaining versus our
+linear probing---is not folklore. It was studied quantitatively in one
+of the very first papers on hash tables, by E.~J.~Isaac and
+R.~C.~Singleton, published in 1956, and the core trade-off they
+identified is still the one you just saw in code.
+
+\begin{verbatim}
+   What the 1956 study established (paraphrased, not quoted):
+
+       "The number of probes required to find an item depends on how
+        the table is filled and on the collision technique used;
+        comparing the techniques requires computing this cost."
+
+   In our terms: chaining keeps clusters short by making the bucket a
+   chain (cost grows with load factor), while open addressing pays a
+   probe penalty that worsens as clusters form. That distinction is the
+   load-factor table above, and it has not changed in seventy years.
+\end{verbatim}
+
+Why cite a paper from 1956? Because it shows that the design questions
+you are making choices about today---probe sequences, load factors,
+memory vs.\ locality---are the same questions the field has measured
+since its beginning. The details have evolved (double hashing, Robin
+Hood hashing), but the fundamental trade-off is a research result, not
+a guess.
+
+\paperref{E.~J.~Isaac, R.~C.~Singleton, ``An Analysis of Alternative
+Collision Detection Techniques,'' Communications of the ACM, 1956}{https://dl.acm.org/doi/10.1145/320604.320609}
+\end{researchnote}
+
+\section{Trees}
+
+\subsection{The General (N-ary) Tree}
+
+A tree is a set of nodes, each with a value and a set of \emph{children}
+that are themselves trees. When a node may have any number of children,
+the simplest encoding carries two pointers: one to the first child, one
+to the next sibling. The child list is a linked list, so the tree is a
+list of lists of trees.
+
+\begin{lstlisting}[caption={The N-ary node: first child, next sibling.}]
+typedef struct tree_node {
+    int value;
+    struct tree_node *first_child;   /* head of the children list */
+    struct tree_node *next_sibling;  /* next sibling in that list */
+} tree_node;
+\end{lstlisting}
+
+\begin{verbatim}
+   The tree:
+
+                    (1)
+                   / | \
+                 (2)(3)(4)
+                 / \    |
+               (5) (6) (7)
+
+   Encoded with first_child / next_sibling:
+
+   (1) -- first_child --> (2) -- next_sibling --> (3) -- next_sibling --> (4)
+                              |                      |                    |
+                              v                      v                    v
+                      +---------+               (NULL)                  (7)
+                      | (5)     |
+                      | next_sib --+            (3) has no children:
+                      +------------+            first_child = NULL
+                                   v
+                              +---------+
+                              | (6)     |
+                              | next_sib --> NULL
+                              +---------+
+
+   Reading the picture: every node's children hang under it in a
+   singly linked chain; the chain's links are "next_sibling".
+\end{verbatim}
+
+A preorder traversal visits a node, then each of its children in turn;
+because the children form a list, the traversal is a loop over siblings
+recursing into each child.
+
+\begin{lstlisting}[caption={Preorder traversal of an N-ary tree.}]
+void tree_print_preorder(const tree_node *root) {
+    const tree_node *child;
+
+    if (root == NULL) {
+        return;
+    }
+
+    printf("%d ", root->value);
+
+    child = root->first_child;
+    while (child != NULL) {
+        tree_print_preorder(child);
+        child = child->next_sibling;
+    }
+}
+\end{lstlisting}
+
+This encoding is how compilers hold syntax trees (an operator with an
+arbitrary number of operands), how file systems hold directory
+hierarchies, and how HTML/XML documents are represented in memory.
+Its cost is that a node needs a \emph{list} to reach its children; its
+gift is that children of one node never share storage with anyone.
+
+\subsection{Binary Trees and Binary Search Trees}
+
+A binary tree is the special case where every node has at most two
+children, conventionally named \code{left} and \code{right}. It is the
+most studied shape in computing, because a \emph{binary search tree}
+(BST) with the ordering property---left subtree holds smaller values,
+right subtree holds larger---gives \code{O(h)} search, where
+\code{h} is the tree height.
+
+\begin{lstlisting}[caption={The BST node.}]
+typedef struct bst_node {
+    int value;
+    struct bst_node *left;
+    struct bst_node *right;
+} bst_node;
+\end{lstlisting}
+
+\begin{verbatim}
+   Inserting 3,1,4,2,5 in that order:
+
+                3
+               / \
+              1   4
+               \   \
+                2   5
+
+   The ordering property, stated at every node:
+     everything in the left subtree  is smaller than the node;
+     everything in the right subtree is larger than the node.
+   Because of it, search is a descent: at each node, go left, go right,
+   or stop. The value 2 is found in three steps, not five.
+\end{verbatim}
+
+Insertion reuses the pointer-to-pointer technique from the linked
+lists: walk a \code{bst\_node **} down until it names an empty link,
+then hang the new leaf there.
+
+\begin{lstlisting}[caption={Insert: descend to an empty link and hang a leaf.}]
+int bst_insert(bst_node **root, int value) {
+    bst_node *new_node;
+    bst_node **cur;
+
+    cur = root;
+    while (*cur != NULL) {
+        if (value < (*cur)->value) {
+            cur = &(*cur)->left;
+        } else if (value > (*cur)->value) {
+            cur = &(*cur)->right;
+        } else {
+            return 1;       /* already present: nothing to do */
+        }
+    }
+
+    new_node = malloc(sizeof(bst_node));
+    if (new_node == NULL) {
+        return 0;
+    }
+    new_node->value = value;
+    new_node->left = NULL;
+    new_node->right = NULL;
+
+    *cur = new_node;        /* the empty link now points at the leaf */
+    return 1;
+}
+\end{lstlisting}
+
+\begin{verbatim}
+   Inserting 2 into the tree above. The descent:
+
+     cur = &root        (names the 3-node)
+     2 < 3  -> cur = &(3.left)     (names the 1-node)
+     2 > 1  -> cur = &(1.right)    (names NULL -- an empty link)
+
+   *cur = new_node hangs the leaf; no parent variable, no special case.
+
+                3
+               / \
+              1   4
+             / \   \
+            ... 2   5
+\end{verbatim}
+
+Search is the same descent, returning true when the value is found.
+
+\begin{lstlisting}[caption={Search: the descent in miniature.}]
+int bst_search(const bst_node *root, int value) {
+    const bst_node *cur;
+
+    cur = root;
+    while (cur != NULL) {
+        if (value < cur->value) {
+            cur = cur->left;
+        } else if (value > cur->value) {
+            cur = cur->right;
+        } else {
+            return 1;
+        }
+    }
+    return 0;
+}
+\end{lstlisting}
+
+A BST walked in-order---left, node, right---visits every value in
+sorted order, which is exactly what a sorted ``print the whole
+collection'' needs.
+
+\begin{lstlisting}[caption={In-order traversal yields sorted output.}]
+void bst_print_inorder(const bst_node *root) {
+    if (root == NULL) {
+        return;
+    }
+    bst_print_inorder(root->left);
+    printf("%d ", root->value);
+    bst_print_inorder(root->right);
+}
+\end{lstlisting}
+
+Deletion is the one operation with three cases, and it is where BSTs
+earn their reputation. The three cases are a leaf, a node with one
+child, and a node with two children.
+
+\begin{lstlisting}[caption={Remove, handling the three structural cases.}]
+/* Remove value. Returns 1 if it was present. */
+int bst_remove(bst_node **root, int value) {
+    bst_node *victim;
+    bst_node *successor;
+
+    if (*root == NULL) {
+        return 0;
+    }
+
+    if (value < (*root)->value) {
+        return bst_remove(&(*root)->left, value);
+    }
+    if (value > (*root)->value) {
+        return bst_remove(&(*root)->right, value);
+    }
+
+    /* Found it: *root is the node to remove. */
+    victim = *root;
+
+    if (victim->left == NULL && victim->right == NULL) {
+        /* Case 1: a leaf. Drop it. */
+        free(victim);
+        *root = NULL;
+        return 1;
+    }
+
+    if (victim->left == NULL) {
+        /* Case 2: only a right child; it replaces the node. */
+        *root = victim->right;
+        free(victim);
+        return 1;
+    }
+    if (victim->right == NULL) {
+        /* Case 2: only a left child; it replaces the node. */
+        *root = victim->left;
+        free(victim);
+        return 1;
+    }
+
+    /* Case 3: two children. Steal the value of the in-order successor
+       (the leftmost node of the right subtree), then delete that
+       successor node, which has at most one child.               */
+    successor = victim->right;
+    while (successor->left != NULL) {
+        successor = successor->left;
+    }
+    victim->value = successor->value;
+    return bst_remove(&victim->right, successor->value);
+}
+\end{lstlisting}
+
+\begin{verbatim}
+   Case 1 (leaf):   delete 9               6
+                                             / \
+        6            6                    3   9      ->  3's right = empty
+       / \          / \                  / \   \
+      3   9   ==>  3   (empty)          1   5   (gone)
+     / \          / \
+    1   5        1   5
+
+   Case 2 (one child):   delete 3         6
+                                             / \
+        6            6                    1   9     ->  3's right promoted
+       / \          / \                  / \   \
+      3   9   ==>  1   9                1   5   7
+     / \   \      / \   \
+    1   5   7    1   5   7
+
+   Case 3 (two children):   delete 6
+        6                   7
+       / \                 / \
+      3   9       ==>     3   9
+     / \   \             / \   \
+    1   5   7           1   5   (the 7-node is gone)
+\end{verbatim}
+
+\begin{insight}[The height is the whole story]
+A BST is only fast if it stays shallow. Inserting already-sorted
+values yields a right-only chain of height \code{n}, and every
+operation becomes \code{O(n)}---a linked list wearing a tree costume.
+Balanced variants (AVL, red--black) guarantee \code{O(log n)} by
+rotating on insertion. We do not implement them here because the
+B-trees below give the same guarantee with a structure the disk and
+cache actually like.
+\end{insight}
+
+\subsection{B-Trees}
+
+A B-tree is the tree that databases and file systems actually use. It
+is a balanced search tree with \emph{wide} nodes: each node holds many
+keys and many children, so a tree of a million keys is only a few
+levels tall, and each visit to a node can read an entire block in one
+I/O. The balance is absolute---every leaf sits at the same depth---and
+it is maintained by splitting nodes that overflow, not by rotations.
+
+\begin{lstlisting}[caption={A B-tree node of order 4 (max 3 keys, 4 children).}]
+#define BTREE_ORDER 4
+
+typedef struct btree_node {
+    int nkeys;                     /* keys currently stored */
+    int keys[BTREE_ORDER - 1];     /* up to 3 keys          */
+    struct btree_node *child[BTREE_ORDER];  /* up to 4 children */
+    int leaf;                      /* 1 if this node has no children */
+} btree_node;
+\end{lstlisting}
+
+\begin{verbatim}
+   A B-tree of order 4 ("2-3-4 tree").  Keys in [ ] , children below.
+
+                    [  20  |  40  ]
+                   /       |       \
+          [ 5 | 10 ]  [ 25 | 30 | 35 ]   [ 60 | 70 ]
+          /    |    \    ...              ...
+       (1,3)  (7,8) (11,15)
+
+   Invariants (order m = 4):
+     - a node with k keys has k+1 children;
+     - every node (except the root) holds between m/2 - 1 and m - 1 keys;
+     - all leaves sit at the same depth;
+     - keys inside a node are ordered, and children bracket them:
+         child[i]   holds keys  <  keys[i]
+         child[i+1] holds keys  >  keys[i]
+
+   Search is one node visit per level, and a node visit is a linear
+   scan of a handful of keys. With wide nodes, height stays tiny:
+   order 200 and a 2-level tree already covers 40,000 keys.
+\end{verbatim}
+
+Search first, because insert descends the same path.
+
+\begin{lstlisting}[caption={Search a B-tree, one node visit per level.}]
+/* Returns 1 if key is present. */
+int btree_search(const btree_node *root, int key) {
+    const btree_node *cur;
+    size_t i;
+
+    cur = root;
+    while (cur != NULL) {
+        /* Find the first key >= key in this node. */
+        i = 0;
+        while (i < (size_t) cur->nkeys && key > cur->keys[i]) {
+            i = i + 1;
+        }
+
+        if (i < (size_t) cur->nkeys && key == cur->keys[i]) {
+            return 1;              /* found in this node */
+        }
+        if (cur->leaf) {
+            return 0;              /* reached a leaf without finding it */
+        }
+        cur = cur->child[i];       /* descend into the correct child */
+    }
+    return 0;
+}
+\end{lstlisting}
+
+Insertion never grows a node beyond \code{m - 1} keys, because we
+\emph{split} any node that is full on the way down. The middle key
+moves up into the parent, and the two halves become children of the
+parent. This is the single idea behind all B-tree variants.
+
+\begin{lstlisting}[caption={Split a full child of cur at child index i.}]
+/* Precondition: cur->child[i] is full (holds BTREE_ORDER-1 keys). */
+void btree_split_child(btree_node *cur, size_t i) {
+    btree_node *child;
+    btree_node *right;
+    size_t mid;
+    size_t j;
+
+    child = cur->child[i];
+    right = malloc(sizeof(btree_node));
+    if (right == NULL) {
+        exit(1);
+    }
+
+    mid = (BTREE_ORDER - 1) / 2;
+    right->leaf = child->leaf;
+    right->nkeys = child->nkeys - (int) mid - 1;
+
+    /* Move the upper half of child's keys into right. */
+    for (j = 0; j < (size_t) right->nkeys; j++) {
+        right->keys[j] = child->keys[mid + 1 + j];
+    }
+    /* Move the upper half of child's children into right. */
+    if (child->leaf == 0) {
+        for (j = 0; j <= (size_t) right->nkeys; j++) {
+            right->child[j] = child->child[mid + 1 + j];
+        }
+    }
+
+    /* Make room in the parent, promote the middle key, link right in. */
+    for (j = cur->nkeys; j > i; j--) {
+        cur->keys[j] = cur->keys[j - 1];
+        cur->child[j + 1] = cur->child[j];
+    }
+    cur->keys[i] = child->keys[mid];
+    cur->child[i + 1] = right;
+
+    child->nkeys = (int) mid;
+    cur->nkeys = cur->nkeys + 1;
+}
+\end{lstlisting}
+
+\begin{verbatim}
+   Splitting a full child during insert.
+
+   BEFORE (child at index 1 is full):          AFTER split:
+        [ 20 ]                                     [ 20 | 30 ]
+        /      \                                 /    |      \
+   [5|10]  [25|30|35]                     [5|10]  [25]  [35]
+   (full: 3 keys)
+
+   - the middle key 30 is PROMOTED into the parent;
+   - the child splits into two nodes of 1 key each (for order 4,
+     a node is at minimum half full after a split);
+   - the parent grew by one key, and may itself need a split next.
+\end{verbatim}
+
+Insert descends from the root, splitting every full node it meets, so
+that when the new key reaches a leaf there is always room for it. The
+root is the only node that may ever be split alone, and splitting the
+root is the only way a B-tree gains a level---balance is never
+temporarily broken.
+
+\begin{verbatim}
+   The growth of a B-tree is the height growing UPWARD:
+
+   [1|2|3]  insert 4  ->  [1]  [2]  [3|4]   (2 moves up, root splits)
+                              |
+                          [ 2 ]
+                         /     \
+                      [1]     [3|4]   ->   insert more... height grows at
+                                          the root, never in the middle.
+\end{verbatim}
+
+\begin{ruleofthumb}[B-trees trade memory for I/O]
+Each node is sized to a block (a disk sector or a cache line), so one
+node read fetches many keys at once. Search becomes ``read a block,
+scan a few keys, repeat,'' with a path length that is the logarithm of
+the key count in base \emph{order}. That is why database indexes and
+filesystem metadata use B-trees and not BSTs.
+\end{ruleofthumb}
+
+\subsection{B+ Trees}
+
+The B+ tree takes the B-tree and separates two jobs: \emph{internal
+nodes hold only keys, for routing}, and \emph{all data lives in the
+leaves}, which are linked together in sorted order. A lookup or range
+scan descends once and then walks the leaf chain, which is sequential
+reads---exactly what rotating disks and SSDs love.
+
+\begin{lstlisting}[caption={The B+ leaf adds a sibling pointer.}]
+typedef struct bplus_node {
+    int leaf;                 /* 1 for a leaf, 0 for an internal node */
+    int nkeys;
+    int keys[BTREE_ORDER - 1];
+    struct bplus_node *child[BTREE_ORDER];
+    struct bplus_node *next;  /* used ONLY by leaves: the sibling link */
+} bplus_node;
+\end{lstlisting}
+
+\begin{verbatim}
+   A B+ tree. Internal nodes hold routing keys only; the data rows
+   live in the leaves, and the leaves are a sorted linked list.
+
+            [ 20 | 40 ]              <- internal: pure routing
+           /     |      \
+    [ 5|10 ]  [ 25|30 ]  [ 60|70 ]   <- internal: still routing
+       |          |          |
+       v          v          v
+   +--------------------------------------------------------------+
+   | leaf (1,3,5,7) -> leaf (20,25,30) -> leaf (40,60,70) -> NULL |
+   +--------------------------------------------------------------+
+
+   "SELECT * FROM t WHERE key BETWEEN 20 AND 60":
+     1. descend to the leaf holding 20;
+     2. walk the leaf chain, reading leaves sequentially.
+     No backtracking, no internal-node data: a straight line of reads.
+\end{verbatim}
+
+\begin{verbatim}
+   B vs B+ at a glance:
+
+                 B-tree               B+ tree
+   data          in every node        only in leaves
+   internal nodes        keys + data + children   keys + children
+   range scan    scatter, no chain    leaf chain = sorted sequence
+   space reuse   duplicate keys in internal nodes   keys duplicated only
+                               between levels (routing copies)
+   best for      general purpose     databases, ordered range queries
+\end{verbatim}
+
+\subsection{B* Trees}
+
+The B* tree tightens the B-tree's occupancy rule: nodes are kept at
+least \emph{two-thirds} full instead of half-full, by redistributing
+keys with a sibling before splitting, and by splitting one full node
+into \emph{three} when both it and its sibling are full. The result is
+fewer, denser nodes---fewer I/Os for the same data---at the cost of a
+more complex insertion.
+
+\begin{verbatim}
+   B* tree: before splitting, borrow from a neighbor.
+
+   order 5, node X full, sibling Y half-full:
+
+        BEFORE                              AFTER (redistribute)
+        [ 15 ]                              [ 17 ]
+       /      \                            /       \
+   [1|5|10|14] [17|20]              [1|5|10|14|15]   [17|20]
+   (full)      (room)
+
+   Only when BOTH are full does a B* split produce THREE nodes,
+   each about 2/3 full, pushing two keys into the parent.
+
+   cost/benefit:
+     B-tree   min 1/2 full   simpler
+     B* tree  min 2/3 full   33% fewer nodes, more complex inserts
+\end{verbatim}
+
+\begin{ruleofthumb}[When to use which tree]
+Use a BST for in-memory data where simplicity wins and the data is
+unpredictable. Use a B-tree when nodes map to blocks (disk, flash,
+caches). Use a B+ tree when ordered range scans matter, as in nearly
+every real database index. Use a B* tree when storage density
+dominates and the extra insertion complexity is justified---they are
+rare outside research and niche storage engines.
+\end{ruleofthumb}
+
+\begin{researchnote}[The B-tree family in the research record]
+The B-tree has one of the longest and best-documented research
+histories in computer science, and two papers in particular define
+what you learned in this section. The first is the paper that
+\emph{invented} the B-tree (Bayer and McCreight, 1972). The second is
+the survey that catalogued its influence on databases (Comer, 1979).
+
+\begin{verbatim}
+   Extracts (condensed for the book):
+
+       Bayer & McCreight (1972): the B-tree was designed so that
+       searching a large ordered file requires only a few page reads,
+       by keeping the tree balanced and each node the size of one
+       storage page.
+
+       Comer (1979), on the family's reach: the B-tree has become the
+       standard method for organizing indexes in file systems and
+       databases, and variants -- B+, B*, prefix B-trees -- were
+       introduced to address specific needs.
+\end{verbatim}
+
+These extracts are paraphrases, not exact sentences; what matters is
+the claim they establish: the wide, shallow, block-sized B-tree is not
+a niche idea but \emph{the} industry-standard index structure, and the
+B+ variant we implemented exists because ordered range scans are what
+real queries need. When you meet \code{btree} indexes in every
+production database, you are looking at a research lineage from 1972.
+
+\paperref{D.~Comer, ``The Ubiquitous B-Tree,'' ACM Computing Surveys
+11(2), 1979}{https://infolab.usc.edu/csci585/Spring2010/den_ar/indexing.pdf}
+
+\paperref{R.~Bayer, E.~McCreight, ``Organization and Maintenance of
+Large Ordered Indexes,'' Acta Informatica 1(3), 1972}{https://dl.acm.org/doi/10.1007/BF00288683}
+\end{researchnote}
+
+\section{Graphs}
+
+\subsection{Graphs as Structs and Arrows}
+
+A graph is a set of \emph{vertices} connected by \emph{edges}. Where a
+tree is a graph with exactly one path between any two nodes and a
+designated root, a graph drops every such restriction: cycles, multiple
+edges, and unreachable regions are all allowed. Graphs model networks of
+every kind---the internet, social graphs, road maps, dependency graphs,
+circuit nets---and they are the most general structure in this chapter.
+
+A graph is \emph{directed} if its edges have a direction (a one-way
+street), \emph{undirected} if they do not (a two-way street), and
+\emph{weighted} if each edge carries a cost. These are three
+independent properties; all eight combinations exist.
+
+\begin{verbatim}
+   Undirected graph:                      Directed graph:
+
+         0 -- 1                              0 --> 1
+         |    |                              ^     |
+         |    |                              |     v
+         2 -- 3                              2 <-- 3
+
+   edges are unordered pairs           edges are ordered pairs
+   0-1 == 1-0                          0->1 is NOT 1->0
+
+   Weighted (undirected):
+
+            5
+       0 -------- 1
+       |          |
+       3          2
+       |          |
+       4 -------- 3
+            1
+
+   each edge carries a number:         DAG (directed acyclic graph):
+   the cost of traveling it.
+                                          A --> B --> D
+                                          |     ^
+                                          v     |
+                                          C --> E
+                                          \
+                                           v
+                                           F
+                                          (no cycle exists; topo-sortable)
+\end{verbatim}
+
+Two representations dominate, and they are the same trade-off we have
+seen all chapter: pointer-honest locality versus constant-time
+directness.
+
+\subsection{Adjacency List}
+
+Each vertex owns a linked list of its edges. The list is exactly the
+linked list of this chapter; the graph is an array of such lists.
+
+\begin{lstlisting}[caption={Adjacency list representation.}]
+typedef struct graph_edge {
+    int to;                  /* the vertex at the other end */
+    int weight;              /* cost of the edge            */
+    struct graph_edge *next; /* next edge leaving this vertex */
+} graph_edge;
+
+typedef struct graph {
+    int n;                   /* number of vertices 0..n-1  */
+    graph_edge **adj;        /* adj[v] = head of v's edge list */
+} graph;
+\end{lstlisting}
+
+\begin{verbatim}
+   The directed graph  0 -> 1 -> 2
+                        ^    |
+                        |    v
+                        3 <- 4
+
+   as an adjacency list (each vertex's outgoing edges):
+
+     adj[0] -> (to=1) -----------> NULL
+     adj[1] -> (to=2) -----------> NULL
+     adj[2] -> NULL
+     adj[3] -> (to=0) -----------> NULL
+     adj[4] -> (to=1) -> (to=3) -> NULL
+
+   Memory is O(V + E): one node per edge, one head per vertex.
+   Asking "who are the neighbors of v?" is walking v's list.
+   Asking "is u adjacent to v?" is walking u's list (or v's).
+\end{verbatim}
+
+Adding an edge pushes onto a vertex's list. For an undirected graph,
+every edge must be added twice---once in each direction---and a
+weighted edge stores its cost in the node.
+
+\begin{lstlisting}[caption={Add a directed edge, and its undirected twin.}]
+/* Add edge u -> v with the given weight. Returns 1 on success. */
+int graph_add_edge(graph *g, int u, int v, int weight) {
+    graph_edge *e;
+
+    e = malloc(sizeof(graph_edge));
+    if (e == NULL) {
+        return 0;
+    }
+    e->to = v;
+    e->weight = weight;
+
+    e->next = g->adj[u];
+    g->adj[u] = e;
+    return 1;
+}
+
+/* Add an undirected edge: it is two directed edges. */
+int graph_add_undirected(graph *g, int u, int v, int weight) {
+    int r1;
+    int r2;
+
+    r1 = graph_add_edge(g, u, v, weight);
+    r2 = graph_add_edge(g, v, u, weight);
+    if (r1 == 0 || r2 == 0) {
+        return 0;
+    }
+    return 1;
+}
+\end{lstlisting}
+
+\begin{verbatim}
+   Memory for one undirected edge u-v:
+
+     adj[u] -> (to=v, w=w) -> ...
+     adj[v] -> (to=u, w=w) -> ...
+
+   Two directed edges model one undirected edge. The weight is stored
+   on both sides, so both directions cost the same--as an undirected
+   edge must.
+\end{verbatim}
+
+\subsection{Adjacency Matrix}
+
+The alternative is a 2D matrix where entry \code{m[u][v]} is 1 (or the
+weight) when the edge \code{u -> v} exists, and 0 otherwise. Any graph
+problem that asks ``is this edge present?'' or needs all-pairs
+information becomes a constant-time lookup.
+
+\begin{lstlisting}[caption={Adjacency matrix representation.}]
+typedef struct matrix_graph {
+    int n;
+    int **m;   /* m[u][v] = weight, or 0 when no edge u->v exists */
+} matrix_graph;
+\end{lstlisting}
+
+\begin{verbatim}
+   Directed graph  0 -> 1 -> 2
+                    ^    |
+                    |    v
+                    3 <- 4
+
+   as a matrix:
+
+         0  1  2  3  4
+       +----------------+
+     0 | 0  1  0  0  0 |     m[0][1] = 1 : the edge 0->1 exists
+     1 | 0  0  1  0  0 |     m[4][3] = 1 : the edge 4->3 exists
+     2 | 0  0  0  0  0 |     every diagonal 0 : no self-loops
+     3 | 1  0  0  0  0 |
+     4 | 0  1  0  1  0 |
+       +----------------+
+
+   Memory is O(V^2) even for a sparse graph; each edge check is O(1).
+   For a WEIGHTED matrix, a 0 is "no edge" and the value is the cost.
+\end{verbatim}
+
+\begin{verbatim}
+   adjacency list vs adjacency matrix:
+
+   concern              adjacency list      adjacency matrix
+   ----------------     -----------------   ------------------
+   memory               O(V + E)            O(V^2)
+   edge check (u,v)?    O(degree) walk      O(1)
+   iterate neighbors    O(degree), cached   O(V), must scan a row
+   add edge             O(1)                O(1)
+   best for             sparse, real nets   dense, small, or
+                                              all-pairs algorithms
+\end{verbatim}
+
+\subsection{DAGs and Topological Order}
+
+A DAG---directed acyclic graph---is a graph with no cycles. DAGs are
+the shape of every dependency system: build systems, package managers,
+compilation order, and spreadsheet cell evaluation all order a set of
+jobs so that every job runs after its prerequisites. A \emph{topological
+order} is an ordering of the vertices in which every edge points
+forward. A graph admits one if and only if it is a DAG.
+
+\begin{verbatim}
+   A build system as a DAG (an arrow u -> v means "u must build
+   before v"):
+
+        lex -----------+
+                       v
+        yacc -----> make ---> main.o ---> myprog
+                   ^                            ^
+                   |                            |
+                   +----------------------------+   (yacc also feeds myprog)
+
+   Topological order must list each target after all of its inputs.
+   Here: lex, yacc, make, main.o, myprog is valid; yacc before make
+   is valid; make before lex is NOT (lex is a dependency of make).
+
+   If a dependency graph has a cycle, no order exists: A needs B,
+   B needs A, someone has to come first and cannot.
+\end{verbatim}
+
+Kahn's algorithm produces a topological order without recursion: count
+every vertex's \emph{indegree} (incoming edges), then repeatedly emit a
+vertex with zero indegree and delete it, decrementing the indegrees of
+its successors. If we run out of zero-indegree vertices before emitting
+everything, a cycle exists.
+
+\begin{lstlisting}[caption={Topological sort by Kahn's algorithm.}]
+#include <stdlib.h>
+
+/* Write a topological order of g into order[]. Returns 1 on success,
+   0 if g has a cycle. */
+int graph_toposort(const graph *g, int *order) {
+    int *indegree;
+    int *queue;
+    int head;
+    int tail;
+    int v;
+    int emitted;
+    const graph_edge *e;
+    size_t i;
+
+    indegree = calloc((size_t) g->n, sizeof(int));
+    queue = malloc(sizeof(int) * (size_t) g->n);
+    if (indegree == NULL || queue == NULL) {
+        free(indegree);
+        free(queue);
+        return 0;
+    }
+
+    /* Pass 1: count incoming edges for every vertex. */
+    for (i = 0; i < (size_t) g->n; i++) {
+        e = g->adj[i];
+        while (e != NULL) {
+            indegree[e->to] = indegree[e->to] + 1;
+            e = e->next;
+        }
+    }
+
+    /* Seed the queue with the vertices that depend on nothing. */
+    head = 0;
+    tail = 0;
+    for (i = 0; i < (size_t) g->n; i++) {
+        if (indegree[i] == 0) {
+            queue[tail] = (int) i;
+            tail = tail + 1;
+        }
+    }
+
+    /* Pass 2: emit zero-indegree vertices, one at a time. */
+    emitted = 0;
+    while (head < tail) {
+        v = queue[head];
+        head = head + 1;
+        order[emitted] = v;
+        emitted = emitted + 1;
+
+        /* Removing v lowers the indegree of each successor. */
+        e = g->adj[v];
+        while (e != NULL) {
+            indegree[e->to] = indegree[e->to] - 1;
+            if (indegree[e->to] == 0) {
+                queue[tail] = e->to;
+                tail = tail + 1;
+            }
+            e = e->next;
+        }
+    }
+
+    free(indegree);
+    free(queue);
+
+    if (emitted != g->n) {
+        return 0;   /* some vertices never reached zero indegree: cycle */
+    }
+    return 1;
+}
+\end{lstlisting}
+
+\begin{verbatim}
+   Kahn's algorithm on the DAG above, step by step:
+
+   indegrees:  lex=0 yacc=0 make=2 main.o=1 myprog=2
+   (lex and yacc depend on nothing, so they are the "sources")
+
+   queue: [lex, yacc]
+   emit lex    ->  make indegree 2-1 = 1
+   emit yacc   ->  make 1-1 = 0, enqueue make; myprog 2-1 = 1
+   emit make   ->  main.o 1-1 = 0, enqueue main.o
+   emit main.o ->  myprog 1-1 = 0, enqueue myprog
+   emit myprog
+
+   order: lex, yacc, make, main.o, myprog    -- every edge points forward.
+\end{verbatim}
+
+\subsection{Traversal: DFS and BFS}
+
+Graphs are explored by two walks, and every serious graph algorithm
+rides on one of them. \emph{Depth-first search} (DFS) dives down a
+path as far as it goes before backtracking; \emph{breadth-first search}
+(BFS) explores in expanding waves. Both mark visited vertices so they
+never revisit, and both visit each vertex and edge once:
+\code{O(V + E)}.
+
+\begin{lstlisting}[caption={DFS, written with an explicit recursion.}]
+/* Print the graph's vertices reachable from start, depth-first. */
+void graph_dfs(const graph *g, int start, int *visited) {
+    const graph_edge *e;
+
+    visited[start] = 1;
+    printf("%d ", start);
+
+    e = g->adj[start];
+    while (e != NULL) {
+        if (visited[e->to] == 0) {
+            graph_dfs(g, e->to, visited);
+        }
+        e = e->next;
+    }
+}
+\end{lstlisting}
+
+\begin{verbatim}
+   DFS order from 0 on:                graph:
+   visit 0, then 0's first neighbor 1,      0 - 1
+   then 1's first unvisited neighbor 3,      | / |
+   then 3's neighbor 2, done; backtrack.    2 - 3
+                                           (undirected)
+
+   order: 0, 1, 3, 2
+   DFS goes as deep as it CAN before trying another neighbor of 0.
+\end{verbatim}
+
+BFS needs a queue; we reuse the array queue pattern from Kahn's
+algorithm.
+
+\begin{lstlisting}[caption={BFS, exploring in waves with a queue.}]
+#include <stdlib.h>
+
+/* Print the vertices reachable from start, breadth-first. */
+void graph_bfs(const graph *g, int start, int *visited) {
+    int *queue;
+    int head;
+    int tail;
+    int v;
+    const graph_edge *e;
+
+    queue = malloc(sizeof(int) * (size_t) g->n);
+    if (queue == NULL) {
+        exit(1);
+    }
+    head = 0;
+    tail = 0;
+
+    visited[start] = 1;
+    queue[tail] = start;
+    tail = tail + 1;
+
+    while (head < tail) {
+        v = queue[head];
+        head = head + 1;
+        printf("%d ", v);
+
+        e = g->adj[v];
+        while (e != NULL) {
+            if (visited[e->to] == 0) {
+                visited[e->to] = 1;
+                queue[tail] = e->to;
+                tail = tail + 1;
+            }
+            e = e->next;
+        }
+    }
+
+    free(queue);
+}
+\end{lstlisting}
+
+\begin{verbatim}
+   BFS order from 0 on the same graph:
+
+   queue: [0]
+   pop 0, enqueue 1, 2          queue: [1, 2]
+   pop 1, enqueue 3             queue: [2, 3]
+   pop 2 (3 already visited)    queue: [3]
+   pop 3                        order: 0, 1, 2, 3
+
+   BFS visits in distance order: everything one hop away, then two,
+   then three. That is why BFS finds SHORTEST paths in an unweighted
+   graph, while DFS is the natural tool for reachability and for
+   detecting cycles.
+\end{verbatim}
+
+\begin{verbatim}
+   DFS vs BFS at a glance:
+
+                DFS                         BFS
+   tool         recursion (or explicit      queue
+                stack)
+   order        deep before wide            distance order
+   best for     reachability, cycles,       shortest paths, routing,
+                topological, mazes          level order, social hops
+   memory       O(depth)                    O(width)
+   both run in  O(V + E), each vertex/edge visited once
+\end{verbatim}
+
+\section{Structures in Bytes}
+
+Every container in this chapter is a struct, so every container has a
+byte size. On a 64-bit machine (\code{int}=4, pointer=8):
+
+\begin{verbatim}
+   structure                node bytes   layout (offsets)
+   ----------------------   ----------   ---------------------------
+   singly linked list       16           value:0  next:8
+   doubly linked list       24           value:0  prev:8  next:16
+   circular list            16           value:0  next:8
+   intrusive list_head      16           next:0   prev:8  (embedded)
+   unrolled node            4 + 4B + 8   count:0 data:4 next:4B+8
+   XOR list                 16           value:0  link:8
+   skip list node           variable     value:0 level:4 forward[] at 8
+   hash-table node          24           key:0 value:8 next:16
+   B-tree node (order 4)    56           nkeys:0 keys:4 child:16 leaf:52
+   graph edge               16           to:0  weight:4  next:8
+\end{verbatim}
+
+Two rows are worth reading twice. The B-tree node rounds up to 56
+bytes because the \code{child[4]} pointer array must start at a
+multiple of 8 (offset 16) and the trailing \code{leaf} int plus
+padding fill the last 8. The skip-list node is variable because its
+\code{forward[]} is a flexible array member: its true size is
+\code{sizeof(skiplist\_node) + level * sizeof(pointer)}. These numbers
+are what decide how many nodes fit in one 64-byte cache line---the
+locality argument every data structure in this chapter is built on.
+
+\section{Summary of the Menagerie}
+
+Every structure in this chapter is the same two tools in a different
+uniform: structs for shape, pointers for arrows, and a rule for who
+owns each allocation. The cost table below is the one page you should
+be able to redraw from memory.
+
+\begin{verbatim}
+   structure           search       insert     delete     notes
+   ------------------  -----------  ---------  ---------  --------------------
+   singly linked       O(n)         O(1)+      O(n)       1 ptr/node
+   doubly linked       O(n)         O(1)+      O(1)+      2 ptrs/node
+   circular            O(n)         O(1)+      O(1)+      ring, tail ptr
+   intrusive           O(n)         O(1)+      O(1)+      links embedded
+   unrolled            O(n)         O(n)       O(n)       blocks, cache
+   XOR                 O(n)         O(1)+      O(1)+      1 ptr, needs prev
+   skip list           O(log n)*    O(log n)*  O(log n)*  towers, sorted
+   hash (chaining)     O(1)*        O(1)*      O(1)*      buckets+chains
+   hash (open addr)    O(1)*        O(1)*      O(1)*      probing
+   BST                 O(h)         O(h)       O(h)       h worst-case = n
+   B-tree / B+/B*      O(log n)     O(log n)   O(log n)   wide, shallow
+   graph adj list      O(deg)       O(1)       O(1)       O(V+E) memory
+   graph adj matrix    O(1)         O(1)       O(1)       O(V^2) memory
+
+   +  given a position/neighbor already found
+   *  expected / probabilistic
+\end{verbatim}
+
+The four questions that opened the chapter are the checklist you apply
+to every one of these---and to every structure you invent:
+
+\begin{verbatim}
+   SHAPE   : draw the struct.  How many pointers?  What points where?
+   COST    : what does search/insert/delete actually touch?
+   OWNER   : who mallocs, who frees, and what happens on the error path?
+   CACHE   : are the bytes the algorithm wants in the same cache line?
+\end{verbatim}
+
+Answer those four honestly and you have designed a data structure;
+code is the last, easy part. With this toolbox in hand we turn from the
+shape of data to the services of the operating system: files, syscalls,
+processes, signals, and the machinery every real C program sits on.
+
+
+
+
+

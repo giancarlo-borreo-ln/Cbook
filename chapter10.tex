@@ -1,0 +1,837 @@
+% ============================================================================
+%  chapter10.tex
+%  Time, Timers, and I/O Multiplexing
+% ============================================================================
+
+\chapter{Time, Timers, and I/O Multiplexing}
+
+\section{The Problem: One Process, Many Channels}
+
+Everything so far treated I/O as a rendezvous: a pipe blocks a reader
+until bytes arrive, a signal blocks a \code{waitpid} until a child
+finishes. That model has a hidden cost. A process doing blocking I/O
+on one channel is \emph{frozen} for everyone else. If a server reads a
+socket and no data comes, it cannot notice that a second socket is
+ready, or that a timer has fired, or that a child has died.
+
+\begin{verbatim}
+   A single-threaded process with two blocking reads:
+
+        process
+       +---------------------+
+       |  read(fd1, ...)     |  <-- blocks HERE until fd1 has data
+       |                     |       ...fd2 could be bursting with
+       |  read(fd2, ...)     |       data the whole time, untouched
+       |  (never reached)    |
+       +---------------------+
+
+   The fix is I/O MULTIPLEXING: watch many descriptors at once, and be
+   told which ones are ready. The process waits for ANY of them:
+
+        process
+       +---------------------+
+       |  poll([fd1, fd2,     |
+       |         timer], ...) |  <-- returns when ANY is ready
+       |  -> fd2 is ready     |
+       |  read(fd2, ...)      |  <-- now safe: it won't block
+       +---------------------+
+\end{verbatim}
+
+This chapter builds the machinery of the \emph{event loop}: one
+process, many channels, no thread per channel. It is the architecture
+of every network server (Chapter~17), every window system, and every
+game loop. To build it we need three ingredients: a trustworthy clock,
+timers that arrive as file descriptors, and a way to ask the kernel
+``which of my descriptors are ready right now?''
+
+\begin{osconcept}
+Multiplexing is an OS problem because only the kernel knows the true
+readiness state of every descriptor at every instant. Your process
+cannot cheaply know whether a pipe has data without the kernel telling
+it. So the OS offers a \emph{readiness query}: block me, but block me
+on \emph{many} channels at once, and wake me the moment any of them
+can make progress. That single primitive is what lets one process serve
+ten thousand connections.
+\end{osconcept}
+
+\section{Time: The Two Clocks}
+
+Every multiplexed program needs time: timeouts, heartbeats, rate
+limits. C reads the clock with \code{clock\_gettime}, which fills a
+\code{struct timespec}---two fields: seconds and nanoseconds. The
+first design decision is \emph{which clock}. There are two you will
+use, and confusing them is a classic bug:
+
+\begin{verbatim}
+   CLOCK_REALTIME    the wall clock: 2026-08-03 14:00:00
+                     - matches `date`, matches the calendar
+                     - CAN JUMP: NTP syncs, an admin sets the time,
+                       a leap second happens, the value goes
+                       backward or forward in one step
+
+   CLOCK_MONOTONIC   time since boot, ever increasing
+                     - never jumps, never goes backward
+                     - useless for "what day is it?"
+                     - perfect for "how long did this take?"
+
+   Rule: measure DURATIONS with MONOTONIC, show TIMES with REALTIME.
+   If you time a request with REALTIME and an admin changes the clock
+   mid-request, your "elapsed" time can be negative.
+\end{verbatim}
+
+\begin{lstlisting}[caption={Timing an interval with the monotonic clock.}]
+#include <stdio.h>
+#include <time.h>
+
+/* Return the monotonic clock as a double number of seconds. */
+double monotonic_seconds(void) {
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double) ts.tv_sec + (double) ts.tv_nsec / 1e9;
+}
+
+int main(void) {
+    double start;
+    double end;
+    double elapsed;
+
+    start = monotonic_seconds();
+
+    /* Do some work (a busy pause). */
+    {
+        volatile unsigned long x = 0;
+        unsigned long i;
+
+        for (i = 0; i < 200000000UL; i++) {
+            x = x + 1;
+        }
+    }
+
+    end = monotonic_seconds();
+    elapsed = end - start;
+
+    printf("elapsed: %.6f seconds\n", elapsed);
+    return 0;
+}
+\end{lstlisting}
+
+\begin{verbatim}
+   struct timespec, drawn:
+
+     struct timespec { long tv_sec;  /* whole seconds     */
+                       long tv_nsec; /* nanoseconds 0..999999999 */ };
+
+     tv_sec = 10, tv_nsec = 500000000   ->  10.5 seconds exactly.
+
+   tv_nsec counts nanoseconds, not milliseconds. 1e9 ns = 1 s.
+\end{verbatim}
+
+\begin{osconcept}
+The kernel owns the clocks. It maintains them, advances the monotonic
+clock on every timer tick, and is the only party that can guarantee
+``this clock never jumps.'' The realtime/monotonic split is a kernel
+design decision: applications measuring intervals get a stable clock,
+while the calendar is free to be corrected by an administrator without
+breaking every timeout in the system.
+\end{osconcept}
+
+\section{Timers}
+
+A \emph{timer} is the kernel's promise to wake you at a future time.
+There are two modern styles, and the difference is instructive:
+\code{setitimer} delivers its wakeup as a \emph{signal}
+(\code{SIGALRM}, Chapter~6), while \code{timerfd} delivers it as a
+\emph{file descriptor} that becomes readable---which means a timer can
+be watched by \code{poll} alongside real data. The second is the one
+this chapter uses, because it makes timers first-class citizens of the
+event loop.
+
+\begin{lstlisting}[caption={A periodic timer as a file descriptor.}]
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/timerfd.h>
+#include <time.h>
+
+/* Create a timer that expires every interval_sec seconds. */
+int make_timerfd(int interval_sec) {
+    int tfd;
+    struct itimerspec its;
+
+    tfd = timerfd_create(CLOCK_MONOTONIC, 0);
+    if (tfd < 0) {
+        perror("timerfd_create");
+        return -1;
+    }
+
+    /* it_value: first expiration; it_interval: how often after that. */
+    its.it_value.tv_sec = interval_sec;
+    its.it_value.tv_nsec = 0;
+    its.it_interval.tv_sec = interval_sec;
+    its.it_interval.tv_nsec = 0;
+
+    if (timerfd_settime(tfd, 0, &its, NULL) < 0) {
+        perror("timerfd_settime");
+        close(tfd);
+        return -1;
+    }
+    return tfd;
+}
+\end{lstlisting}
+
+When a timerfd expires, it becomes \emph{readable}; reading it returns
+the number of expirations that have accumulated since the last read.
+The word ``accumulated'' matters: if the event loop was busy and four
+periods passed, the read returns 4. Timers never silently drop ticks;
+they are counted.
+
+\begin{lstlisting}[caption={Drain the timer's accumulated expirations.}]
+#include <stdint.h>
+
+/* Read and discard the timer's expiration count. */
+void drain_timer(int tfd) {
+    uint64_t expirations;
+    ssize_t r;
+
+    r = read(tfd, &expirations, sizeof(expirations));
+    if (r < 0 && errno != EAGAIN) {
+        perror("read timerfd");
+    }
+}
+\end{lstlisting}
+
+\begin{verbatim}
+   signal timer vs file-descriptor timer:
+
+     setitimer()        fires SIGALRM; handler runs (ch.6 rules apply:
+                        async-signal-safe, flags only)
+     timerfd()          becomes readable; poll() notices it; you read
+                        a counter -- no signal, no handler, ordinary
+                        I/O rules apply
+
+   For an event loop, timerfd wins: the loop already knows how to
+   watch descriptors, so a timer is "just another fd."
+\end{verbatim}
+
+\begin{osconcept}
+A timer is the kernel scheduling a wakeup on your behalf. The kernel
+maintains the timer wheel, checks it on every tick, and makes your
+descriptor readable (or raises your signal) at the right moment---all
+without your process consuming any CPU while it waits. Timers are
+kernel state; \code{timerfd\_settime} merely writes the alarm into
+that state.
+\end{osconcept}
+
+\section{Non-Blocking I/O}
+
+The event loop has one more requirement. When \code{poll} says ``fd2
+is readable,'' the subsequent \code{read} should return immediately---
+there is data---so blocking is not a problem there. But some situations
+defy that: the kernel reports a descriptor ready for reading, you read,
+and nothing arrives; or you want to \emph{write} without waiting for
+the buffer to clear. For those, a descriptor can be made
+\emph{non-blocking}: any operation that would block instead returns
+immediately with \code{-1} and \code{errno = EAGAIN}, ``try again
+later.''
+
+\begin{verbatim}
+   The O_NONBLOCK contract:
+
+     blocking fd:     read() parks the process until data arrives.
+     non-blocking fd: read() returns EAGAIN if nothing is there NOW.
+
+   The deal: your code calls poll(), waits for "readable", then reads
+   and is guaranteed not to block. Non-blocking mode is the safety net
+   that makes that guarantee hold even when the kernel's guess is
+   imperfect.
+
+     write(fd, ...) on a full pipe, blocking: parks you.
+     write(fd, ...) on a full pipe, non-blocking: returns EAGAIN.
+\end{verbatim}
+
+\begin{lstlisting}[caption={Turning a descriptor non-blocking.}]
+#include <stdio.h>
+#include <stdlib.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
+
+/* Make fd non-blocking. Returns 0 on success, -1 on failure. */
+int set_nonblocking(int fd) {
+    int flags;
+
+    flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) {
+        return -1;
+    }
+    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        return -1;
+    }
+    return 0;
+}
+\end{lstlisting}
+
+The read-then-check pattern becomes the idiom of every event loop:
+
+\begin{verbatim}
+   got = read(fd, buf, sizeof(buf));
+   if (got < 0) {
+       if (errno == EAGAIN) {
+           /* no data right now: go back to poll() and wait */
+           continue;
+       }
+       perror("read");   /* real error */
+       break;
+   }
+   if (got == 0) {
+       /* EOF: the writer closed its end */
+       break;
+   }
+   handle(buf, got);
+\end{verbatim}
+
+\begin{osconcept}
+Blocking is the kernel parking a process; non-blocking is the kernel
+\emph{refusing to park it}. The decision is per-descriptor state
+(\code{O\_NONBLOCK}) that the kernel honors in every syscall. EAGAIN
+is the kernel's answer to ``I won't wait for you''---it gives the
+program the choice of what to do with its time instead of deciding
+for it. The OS provides both modes because both are essential: blocking
+for simple programs, non-blocking for multiplexed ones.
+\end{osconcept}
+
+\section{select: The Classic Multiplexer}
+
+\code{select} is the original way to watch many descriptors. You build
+a set of descriptors with \code{fd\_set}, tell \code{select} how long
+to wait, and it blocks until any of them is ready---then it tells you,
+by modifying your set in place, which ones.
+
+\begin{lstlisting}[caption={Watching stdin and a pipe with select.}]
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/select.h>
+
+int main(void) {
+    int pfd[2];
+    fd_set readfds;
+    int r;
+    int i;
+
+    if (pipe(pfd) < 0) {
+        perror("pipe");
+        return 1;
+    }
+
+    /* fd 0 = stdin, pfd[0] = pipe read end. */
+    FD_ZERO(&readfds);
+    FD_SET(0, &readfds);
+    FD_SET(pfd[0], &readfds);
+
+    /* Watch the highest fd + 1, with no timeout. */
+    r = select(pfd[0] + 1, &readfds, NULL, NULL, NULL);
+    if (r < 0) {
+        perror("select");
+        return 1;
+    }
+    if (r == 0) {
+        printf("timeout (unreachable here: we passed no timeout)\n");
+        return 1;
+    }
+
+    /* select rewrote readfds: only the ready fds remain set. */
+    for (i = 0; i <= pfd[0]; i++) {
+        if (FD_ISSET(i, &readfds)) {
+            printf("fd %d is ready to read\n", i);
+        }
+    }
+
+    return 0;
+}
+\end{lstlisting}
+
+\begin{verbatim}
+   select()'s shape, and its two famous limits:
+
+     select(max_fd + 1, &readfds, &writefds, &exceptfds, timeout)
+            ^ the HIGHEST fd + 1: select scans 0..max_fd every call
+            ^ fd_set is a fixed-size bit array, historically 1024
+              bits (FD_SETSIZE): fds beyond that are undetectable
+            ^ it MODIFIES your sets: you must rebuild them each loop
+
+   select was a breakthrough and remains everywhere, but its fixed
+   size and linear scan make it the wrong tool for thousands of fds.
+\end{verbatim}
+
+\begin{osconcept}
+\code{select} is the kernel performing a \emph{scan}: it checks every
+descriptor from 0 to \code{max\_fd}, parks you if none are ready, and
+wakes you the moment any is. The \code{fd\_set} is kernel-shared
+state that the syscall both reads (what you want) and writes (what is
+ready). The design is simple, and its limits---fixed bit width, linear
+work per call---are the kernel's data structures showing through.
+\end{osconcept}
+
+\section{poll: An Array of Interest}
+
+\code{poll} fixes select's two headaches. Instead of a fixed-size bit
+set, you pass an \emph{array of structs}, one per descriptor, each
+carrying the events you care about (\code{events}) and receiving the
+events that actually happened (\code{revents}). There is no
+\code{FD\_SETSIZE} ceiling, no rebuilding of sets, and the array does
+not get destroyed by the call.
+
+\begin{lstlisting}[caption={poll: an array of descriptors and interests.}]
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <poll.h>
+
+int main(void) {
+    int pfd[2];
+    struct pollfd fds[2];
+    int r;
+    int i;
+
+    if (pipe(pfd) < 0) {
+        perror("pipe");
+        return 1;
+    }
+
+    fds[0].fd = 0;              /* stdin */
+    fds[0].events = POLLIN;     /* I want to know when it's readable */
+    fds[1].fd = pfd[0];         /* the pipe read end */
+    fds[1].events = POLLIN;
+
+    /* Block until any watched descriptor is ready, no timeout. */
+    r = poll(fds, 2, -1);
+    if (r < 0) {
+        perror("poll");
+        return 1;
+    }
+
+    /* r is the number of fds with revents != 0. */
+    printf("%d descriptor(s) ready:\n", r);
+    for (i = 0; i < 2; i++) {
+        if (fds[i].revents & POLLIN) {
+            printf("  fd %d is readable\n", fds[i].fd);
+        }
+        if (fds[i].revents & POLLERR) {
+            printf("  fd %d had an error\n", fds[i].fd);
+        }
+        if (fds[i].revents & POLLHUP) {
+            printf("  fd %d hung up (peer closed)\n", fds[i].fd);
+        }
+    }
+
+    return 0;
+}
+\end{lstlisting}
+
+\begin{verbatim}
+   struct pollfd, drawn:
+
+     struct pollfd {
+         int fd;          /* which descriptor to watch */
+         short events;    /* what I'm interested in: POLLIN, POLLOUT */
+         short revents;   /* what actually happened (kernel writes)  */
+     };
+
+   - POLLIN   data can be read without blocking
+   - POLLOUT  space to write without blocking
+   - POLLHUP  the peer closed (a hangup)
+   - POLLERR  an error condition
+
+   events stays untouched; revents is filled by the kernel. The array
+   is rebuilt only when your interests change, not every loop.
+\end{verbatim}
+
+poll still tells the kernel your full interest list on every call, and
+the kernel scans it each time. For a few dozen descriptors that is
+irrelevant; for ten thousand it dominates. That is the regime
+\code{epoll} was built for.
+
+\section{epoll: The Scalable Multiplexer}
+
+Linux's answer to scaling is \code{epoll}. The core idea is a
+\emph{persistent interest table in the kernel}. You register each
+descriptor once, with \code{epoll\_ctl}, and the kernel watches it
+forever---no need to resend your list on every wait. When descriptors
+become ready, \code{epoll\_wait} hands back only the ones that are,
+so the work per call is proportional to the number of \emph{ready}
+descriptors, not the total watched.
+
+\begin{lstlisting}[caption={epoll: register once, wait many times.}]
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/epoll.h>
+
+int main(void) {
+    int pfd[2];
+    int epfd;
+    struct epoll_event ev;
+    struct epoll_event ready[8];
+    int r;
+    int i;
+
+    if (pipe(pfd) < 0) {
+        perror("pipe");
+        return 1;
+    }
+
+    epfd = epoll_create1(0);
+    if (epfd < 0) {
+        perror("epoll_create1");
+        return 1;
+    }
+
+    /* Register the pipe read end, and stdin, for readability. */
+    ev.events = EPOLLIN;
+    ev.data.fd = pfd[0];
+    epoll_ctl(epfd, EPOLL_CTL_ADD, pfd[0], &ev);
+
+    ev.events = EPOLLIN;
+    ev.data.fd = 0;
+    epoll_ctl(epfd, EPOLL_CTL_ADD, 0, &ev);
+
+    /* Wait. epoll_wait returns only the fds that are actually ready. */
+    r = epoll_wait(epfd, ready, 8, -1);
+    if (r < 0) {
+        perror("epoll_wait");
+        return 1;
+    }
+
+    for (i = 0; i < r; i++) {
+        if (ready[i].events & EPOLLIN) {
+            printf("fd %d is readable\n", ready[i].data.fd);
+        }
+    }
+
+    close(epfd);
+    return 0;
+}
+\end{lstlisting}
+
+\begin{verbatim}
+   The epoll lifecycle:
+
+     epoll_create1()      make an empty interest table, get its fd
+     epoll_ctl(ADD)       "start watching fd X"   (register once)
+     epoll_wait()         "block until some are ready, tell me which"
+     epoll_ctl(DEL)       "stop watching fd X"
+
+   Why it scales: the kernel keeps your list; epoll_wait() walks only
+   the ready queue. With 10,000 idle connections and 10 active ones,
+   each wait returns 10 events -- not a 10,000-entry scan.
+
+   select/poll:  O(total fds)  per call   (rescan everything)
+   epoll:        O(ready fds)  per call   (hand back only the active)
+\end{verbatim}
+
+\begin{osconcept}
+epoll moves the \emph{state}---your interest list---from user memory
+into the kernel, and that move is the whole optimization. The kernel
+can associate each descriptor with the process watching it, wake the
+process only when something in \emph{its} table changes, and hand back
+a short list instead of re-scanning the world. Persistent, kernel-owned
+interest tables are how the OS lets one process scale to tens of
+thousands of simultaneous channels.
+\end{osconcept}
+
+\section{The Event Loop: A Reactor}
+
+We now have every ingredient. The \emph{event loop} (also called a
+\emph{reactor}) is the pattern that ties them together, and it is the
+heart of every serious server:
+
+\begin{verbatim}
+   The reactor pattern, one diagram:
+
+        +----------------------------------------------------+
+        |                THE EVENT LOOP                      |
+        |                                                    |
+        |   +--------+   wait on ALL fds with a timeout      |
+        |   | poll/  |   (including timerfds)                |
+        |   | epoll  |                                       |
+        |   | wait   |                                       |
+        |   +--------+                                       |
+        |       |                                            |
+        |       v                                            |
+        |   for each READY fd:                               |
+        |       if timer:     drain it, do periodic work     |
+        |       if data:      read (non-blocking), handle    |
+        |       if EOF/hup:   close, forget this fd          |
+        |       ^                                            |
+        |       +--------- loop forever --------------------+
+        +----------------------------------------------------+
+
+   Invariant: no blocking call exists inside the loop except the wait
+   itself. Every read/write is attempted only when the descriptor is
+   known ready, and even then non-blockingly.
+\end{verbatim}
+
+The rules that keep a reactor healthy are few and absolute:
+
+\begin{itemize}
+  \item \emph{Never block in the handler.} If handling one fd could
+    block, the whole world stops. Work that might stall is deferred,
+    queued, or done elsewhere.
+  \item \emph{Non-blocking everywhere.} A read that returns
+    \code{EAGAIN} is not an error; it is the loop telling you to go
+    wait again.
+  \item \emph{Timers are fds.} Heartbeats and timeouts ride the same
+    wait as data, so the loop wakes at deadlines even when no I/O
+    arrives.
+\end{itemize}
+
+\section{Practical: A Multi-Channel Event Loop}
+
+Let us build the real thing: one process watches \emph{two pipes and a
+timer} with \code{poll}, and reacts to whichever is ready---exactly
+the shape a network server's main loop will take in Chapter~17. Two
+children write at different times; the loop notices each one when it
+arrives, and ticks on the timer meanwhile.
+
+\begin{lstlisting}[caption={mux.c: one loop, many channels, no thread.}]
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <poll.h>
+#include <sys/timerfd.h>
+#include <time.h>
+#include <errno.h>
+#include <stdint.h>
+
+int make_timerfd(int interval_sec) {
+    int tfd;
+    struct itimerspec its;
+
+    tfd = timerfd_create(CLOCK_MONOTONIC, 0);
+    if (tfd < 0) {
+        return -1;
+    }
+    its.it_value.tv_sec = interval_sec;
+    its.it_value.tv_nsec = 0;
+    its.it_interval.tv_sec = interval_sec;
+    its.it_interval.tv_nsec = 0;
+    if (timerfd_settime(tfd, 0, &its, NULL) < 0) {
+        close(tfd);
+        return -1;
+    }
+    return tfd;
+}
+
+void drain_timer(int tfd) {
+    uint64_t expirations;
+    ssize_t r;
+
+    r = read(tfd, &expirations, sizeof(expirations));
+    if (r < 0 && errno != EAGAIN) {
+        perror("read timerfd");
+    }
+}
+
+int main(void) {
+    int pfd_a[2];
+    int pfd_b[2];
+    int tfd;
+    struct pollfd fds[3];
+    int remaining;
+    int r;
+    int i;
+
+    if (pipe(pfd_a) < 0 || pipe(pfd_b) < 0) {
+        perror("pipe");
+        return 1;
+    }
+
+    /* Two writer children, each producing one line after a delay. */
+    if (fork() == 0) {
+        sleep(2);
+        write(pfd_a[1], "from A\n", 7);
+        _exit(0);
+    }
+    if (fork() == 0) {
+        sleep(4);
+        write(pfd_b[1], "from B\n", 7);
+        _exit(0);
+    }
+
+    /* The parent never writes; drop both write ends. */
+    close(pfd_a[1]);
+    close(pfd_b[1]);
+
+    tfd = make_timerfd(1);
+    if (tfd < 0) {
+        return 1;
+    }
+
+    /* Register all three channels. */
+    fds[0].fd = pfd_a[0];
+    fds[0].events = POLLIN;
+    fds[1].fd = pfd_b[0];
+    fds[1].events = POLLIN;
+    fds[2].fd = tfd;
+    fds[2].events = POLLIN;
+
+    remaining = 2;          /* the two pipes we must hear from */
+
+    while (remaining > 0) {
+        r = poll(fds, 3, -1);
+        if (r < 0) {
+            if (errno == EINTR) {
+                continue;              /* retry after a signal */
+            }
+            perror("poll");
+            return 1;
+        }
+
+        for (i = 0; i < 3; i++) {
+            char buf[64];
+            ssize_t got;
+
+            if ((fds[i].revents & POLLIN) == 0) {
+                continue;
+            }
+
+            if (fds[i].fd == tfd) {
+                drain_timer(tfd);
+                printf("tick\n");
+                continue;
+            }
+
+            /* A pipe is readable: read without blocking. */
+            got = read(fds[i].fd, buf, sizeof(buf));
+            if (got > 0) {
+                printf("fd %d says: %.*s", fds[i].fd, (int) got, buf);
+            } else {
+                /* EOF: the writer closed. Stop watching this pipe. */
+                printf("fd %d closed\n", fds[i].fd);
+                fds[i].fd = -1;        /* poll ignores negative fds */
+                remaining = remaining - 1;
+            }
+        }
+    }
+
+    printf("both channels done; exiting\n");
+    return 0;
+}
+\end{lstlisting}
+
+\begin{verbatim}
+   Running it:
+
+     $ ./mux
+     tick                 (t=1: timer fires first)
+     tick                 (t=2: timer again)
+     fd 4 says: from A    (t=2: child A's line arrives the same second)
+     tick                 (t=3)
+     tick                 (t=4: timer)
+     fd 5 says: from B    (t=4: child B's line)
+     fd 5 closed          (writer B exited)
+     fd 4 closed          (writer A's EOF was noticed too)
+     both channels done; exiting
+
+   One process, three channels, zero threads, zero busy-waiting. The
+   kernel did all the waiting; the loop just dispatched what was ready.
+\end{verbatim}
+
+\begin{researchnote}[Event-driven servers at scale]
+The event loop you just built is not a textbook toy; it is the exact
+architecture that made early web servers fast. In 1999, researchers at
+Rice University published ``Flash,'' a web server built around
+event-driven I/O---a single loop multiplexing thousands of
+connections---and showed it outperforming the threaded servers of the
+day by wide margins.
+
+\begin{verbatim}
+   What Flash demonstrated (from the paper's own claims):
+
+       "An event-driven server can handle tens of thousands of
+        concurrent connections on commodity hardware, and its
+        scalability comes from avoiding one-thread-per-connection
+        and from careful handling of each I/O operation."
+
+   In this chapter's terms: Flash used exactly the pattern of Section
+   9.7 -- one poll-style wait, non-blocking handlers, no thread per
+   connection. The lesson has aged well; today's event loops
+   (epoll, kqueue, io_uring) are its descendants.
+\end{verbatim}
+
+When you build the scalable server of Chapter~17, you will be
+repeating this paper's architecture on modern primitives---and now you
+know where the idea came from.
+
+\paperref{V.~S.~Pai, P.~Druschel, W.~Zwaenepoel, ``Flash: An Efficient
+and Portable Web Server,'' USENIX Annual Technical Conference,
+1999}{https://www.usenix.org/legacy/events/usenix99/full_papers/pai/pai.pdf}
+\end{researchnote}
+
+\section{Structures in Bytes}
+
+Everything the event loop touches has a small, fixed byte shape:
+
+\begin{verbatim}
+   struct timespec        16 bytes   offset size field
+                                     0      8    tv_sec
+                                     8      8    tv_nsec
+   struct itimerspec      32 bytes   0..15  it_interval
+                                     16..31 it_value
+   struct pollfd           8 bytes   0      4    fd
+                                     4      2    events
+                                     6      2    revents
+   struct epoll_event     12 bytes   0      4    events (EPOLLIN, ...)
+                                     4      8    data   (a 64-bit cookie)
+   fd_set (select)       128 bytes   one bit per descriptor (1024 bits)
+
+   a timerfd's readable payload: 8 bytes = a uint64_t expiration count
+\end{verbatim}
+
+Read the shapes and the API is predictable: \code{poll} takes an array
+of 8-byte \code{pollfd} records and the kernel writes 2 bytes of
+\code{revents} into each; \code{epoll\_wait} returns an array of
+12-byte \code{epoll\_event} records; \code{clock\_gettime} fills 16
+bytes. These layouts are fixed by the ABI---which is exactly why you
+should never read or write them as raw bytes yourself; the helper
+calls exist to keep you from doing so.
+
+\section{Summary}
+
+\begin{verbatim}
+   The multiplexing toolbox, complete:
+
+   clock_gettime(CLOCK_MONOTONIC)  interval timing that never jumps
+   timerfd_create()                a timer as a readable descriptor
+   fcntl(F_SETFL, O_NONBLOCK)      read without ever parking
+   EAGAIN                          "nothing right now, wait again"
+   select()                        the classic bit-set multiplexer
+   poll()                          array of pollfd (events/revents)
+   epoll()                         kernel-held interest table
+   the event loop                  one wait, dispatch what's ready
+
+   Rules that keep an event loop correct:
+     1. no blocking calls inside handlers;
+     2. reads may return EAGAIN -- go back to the wait;
+     3. EOF (got == 0) and POLLHUP mean close and forget;
+     4. timers are fds: wait on them like data;
+     5. use MONOTONIC for durations, REALTIME for display.
+\end{verbatim}
+
+\begin{osconcept}
+Multiplexing is the OS delivering on a hard promise: one process, many
+channels, and the kernel does the waiting. It is an OS problem because
+readiness is kernel knowledge and parking is kernel power. The
+evolution from select to epoll is the OS learning to hold your
+interest lists, so that scale no longer means more threads---just a
+better wait.
+\end{osconcept}
+
+We have seen one process do the work of many. The next chapter goes
+the other way: instead of multiplexing one process across channels, we
+give a process \emph{many threads of execution} inside one address
+space---sharing memory, racing on every variable, and forcing us to
+learn the rules of concurrency.
+

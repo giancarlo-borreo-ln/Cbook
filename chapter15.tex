@@ -1,0 +1,677 @@
+% ============================================================================
+%  chapter15.tex
+%  The Linux Filesystem Hierarchy
+% ============================================================================
+
+\chapter{The Linux Filesystem Hierarchy}
+
+\section{The One Tree}
+
+Every file on a Linux system lives in one tree, hanging from the single
+root \code{/}. There is no C:\, no drive letters, no per-device roots.
+A USB stick, a network share, and the hard disk all appear as
+\emph{parts of the same tree}, attached at directories called
+\emph{mount points}. This chapter is a map of that tree: what lives in
+each directory, why it lives there, and---more interestingly---how the
+layout came to be and what operating-system ideas it encodes.
+
+\begin{verbatim}
+   The whole machine, as seen from one path:
+
+        /
+        |-- bin/      essential user programs
+        |-- sbin/     essential system administration programs
+        |-- lib/      shared libraries for /bin and /sbin
+        |-- etc/      host-specific configuration
+        |-- home/     user home directories
+        |-- root/     the superuser's home
+        |-- boot/     the kernel and boot images
+        |-- dev/      the hardware, as files
+        |-- tmp/      world-writable scratch
+        |-- var/      variable data: logs, spools, caches
+        |-- run/      runtime state since boot
+        |-- usr/      the bulk of the system
+        |-- opt/      third-party software
+        |-- srv/      service data
+        |-- mnt/      temporary mount points
+        |-- media/    removable media
+        |-- proc/     kernel and process info, generated on the fly
+        `-- sys/      kernel devices and parameters, on the fly
+\end{verbatim}
+
+We have met every idea in this tree already. Chapter~8 gave us the
+\emph{namespace}: names pointing to inodes pointing to blocks. This
+chapter maps that namespace, adds the history that shaped it, and
+explains the OS machinery---mount points, virtual filesystems, device
+nodes, tmpfs---that makes one tree possible over many kinds of storage.
+
+\begin{osconcept}
+A single tree is an operating system decision with enormous payoff. By
+folding every storage device into one namespace, the OS lets programs
+refer to anything---a disk, a terminal, a kernel statistic, a network
+stream---with one syntax and one set of tools. The cost is that the
+tree's \emph{meaning} is not self-evident; a standard layout is needed
+so every program can find what it needs. That standard, and the OS
+mechanisms behind it, are this chapter's subject.
+\end{osconcept}
+
+\section{The Story of the Tree}
+
+The layout was not designed on a whiteboard. It \emph{grew}, one
+survival decision at a time, and its quirks are fossils of that
+history.
+
+\begin{verbatim}
+   1971 -- Version 1 Unix, Bell Labs. The entire operating system runs
+   in roughly 32 KB of memory on a single disk. The tree is already
+   there, and it is tiny:
+
+        /bin     the handful of programs (cat, ls, sh, cc...)
+        /etc     "et cetera" -- configuration and random admin files
+        /dev     the devices (a magnetic tape, a disk, a console)
+        /usr     the user files -- this is where HOME DIRECTORIES were
+
+   That is the whole story's seed: the first Unix had about five
+   directories, and /usr really did mean "user."
+
+   The RK05 disk pack.  The story of /usr's split:
+   The root filesystem lived on a small fixed disk. The /usr filesystem
+   lived on a larger removable RK05 pack. To boot and repair a broken
+   system you could only use the small disk, so the binaries needed to
+   recover sat in /bin; everything else -- and the users' files -- went
+   to /usr. When the repair disk could not mount /usr, you still had a
+   working, minimal system. The split is a backup-and-repair strategy
+   fossilized into the layout.
+\end{verbatim}
+
+From that seed, two evolutionary pressures shaped the rest. First,
+\emph{hardware}: as disks grew, the idea of ``the tiny essential set
+vs the rest'' persisted as \code{/bin} vs \code{/usr/bin}, and the
+early \code{/usr} directory---which had held home directories---was
+colonized by system software, while user files moved to
+\code{/home}. Second, \emph{diversity}: BSD and System V rearranged
+and disagreed (BSD favored \code{/usr/local} for add-ons, System V
+introduced \code{/opt}), and by the early 1990s every Linux
+distribution had its own slightly different tree.
+
+\begin{verbatim}
+   The tree diverged, and Linux inherited the mess:
+     1980s: BSD and System V each reorganize; /home becomes the user
+            area; /usr/local, /opt, /var appear in different forms.
+     1993:  the Filesystem Hierarchy Standard (FHS) is started to
+            make the layout CONSISTENT across Linux distributions --
+            so that /etc/passwd means the same thing everywhere, and
+            a package built for one distribution finds its libraries
+            on another. The FHS (now version 3.0, 2015) is the tree's
+            constitution.
+
+   Two modern chapters in the story:
+     The "usr merge" (2010s).  Distributions began making /bin,
+       /sbin, /lib symlinks to /usr/bin, /usr/sbin, /usr/lib -- one
+       copy of the system software, not two. The old split existed for
+       repair-on-a-tiny-disk reasons that a 2015 disk no longer has.
+     The arrival of /run (2011).  Runtime state (pids, sockets) moved
+       out of /var/run into /run, a tmpfs mounted before /var is --
+       because early boot needs the state before the big disk is up.
+\end{verbatim}
+
+\begin{osconcept}
+The tree's history is a history of operating-system constraints. The
+root-vs-usr split encodes repair strategy; the FHS encodes
+\emph{portability and coordination} (a standard layout is an agreement
+that package managers, bootloaders, and administrators all rely on);
+the usr-merge and \code{/run} encode the modern boot sequence. Reading
+the tree is reading forty years of OS decisions, each one a solution
+to a problem of its era.
+\end{osconcept}
+
+\section{The OS Concept: Mount Points and the Root Filesystem}
+
+How does one tree hold many disks? The answer is \emph{mounting}. A
+\emph{mount point} is a directory in the tree where a filesystem is
+\emph{attached}. The kernel hangs the root of one filesystem onto a
+directory of another, and from then on the two are one tree. The
+\emph{root filesystem} is the one mounted at \code{/}; everything else
+is grafted onto it.
+
+\begin{verbatim}
+   Two filesystems, one tree:
+
+     before mounting:                      after mounting:
+     (root fs on disk A)                   (disk B visible at /home)
+       /                                    /
+       |-- bin/                             |-- bin/
+       |-- etc/                             |-- etc/
+       `-- home/  (empty dir,             |-- home/
+                 a mount point)                 |-- alice/
+             (disk B: /home)                    `-- bob/
+       /home                                  (the files of disk B)
+       |-- alice/
+       `-- bob/
+
+   Mounting is an OS operation (`mount`):
+     1. the kernel reads disk B's superblock,
+     2. it attaches disk B's root to the directory /home,
+     3. from then on, "alice" is found by walking INTO /home.
+
+   Key facts:
+     - A mount point is just a directory. Its own contents are
+       HIDDEN while a filesystem is mounted over it.
+     - Different filesystems can sit at different mounts: ext4 at /,
+       tmpfs at /tmp, proc at /proc, a USB drive at /media/usb.
+     - Only the kernel can perform the graft, which is why mounting
+       is a privileged operation and why /etc/fstab (the table of
+       "what mounts where at boot") is a system file.
+\end{verbatim}
+
+\begin{lstlisting}[caption={Reading the mount table from inside a program.}]
+#include <stdio.h>
+
+int main(void) {
+    FILE *f;
+    char line[256];
+
+    /* /proc/mounts is the kernel's own list of what is mounted where. */
+    f = fopen("/proc/mounts", "r");
+    if (f == NULL) {
+        perror("fopen");
+        return 1;
+    }
+
+    while (fgets(line, sizeof(line), f) != NULL) {
+        printf("%s", line);     /* device  mount_point  type  options */
+    }
+
+    fclose(f);
+    return 0;
+}
+\end{lstlisting}
+
+The output (a few lines of it) looks like:
+
+\begin{verbatim}
+   /dev/sda1 / ext4 rw,relatime ...
+   proc /proc proc rw,relatime ...
+   sysfs /sys sysfs rw,relatime ...
+   devtmpfs /dev devtmpfs rw ...
+   tmpfs /tmp tmpfs rw ...
+   tmpfs /run tmpfs rw ...
+
+   Read it as: "the device (or pseudo-device) on the left is attached
+   at the directory in the middle, with the filesystem type on the
+   right." / is ext4 on the real disk; /proc, /sys, /dev, /tmp, /run
+   are their own (often RAM-backed or virtual) filesystems.
+\end{verbatim}
+
+\begin{osconcept}
+Mounting is the kernel's namespace surgery: it rewrites the tree's
+resolution so that a directory names a different filesystem's root.
+Only the kernel can do this, because only the kernel owns the mapping
+from paths to inodes and the translation from one filesystem's
+structures to another's. The mount table \emph{is} the tree's
+scaffolding; the directories you see are the leaves it supports.
+\end{osconcept}
+
+\section{The Directories, One by One}
+
+With the machinery in place, here is the tree as a reference. For each
+directory: what it holds, what it does, and the problem it solves.
+
+\subsection{The Core}
+
+\begin{verbatim}
+   /bin   essential user programs (ls, cp, mv, cat, sh...)
+          -- what you need to boot, repair, and use a bare system.
+          On modern distributions /bin is a symlink to /usr/bin
+          (the "usr merge"): one copy, two names.
+          PROBLEM SOLVED: "essential" vs "everything else" was the
+          1971 repair strategy; the merge removes the duplicate.
+
+   /sbin  essential ADMINISTRATION programs (mount, fdisk, shutdown...)
+          -- the tools that repair and maintain the system itself.
+          Also merged into /usr/sbin on modern systems.
+          PROBLEM SOLVED: keeping the tools that can break the
+          system out of the hands of ordinary PATH lookups.
+
+   /lib   shared libraries for /bin and /sbin (libc, the dynamic
+          loader) -- without these, the essential binaries cannot run.
+          Merged into /usr/lib.
+          PROBLEM SOLVED: one copy of each library, shared by every
+          program that uses it (see Chapter 13's memory chapter).
+
+   /etc   host-specific CONFIGURATION. /etc/passwd (users),
+          /etc/fstab (what mounts where), /etc/hosts (names),
+          /etc/ssh (server keys)... The name is "et cetera": the
+          directory where the files that fit nowhere else went.
+          PROBLEM SOLVED: separating the machine's own settings from
+          the software (which lives in /usr, shared or reinstallable).
+          /etc is what an administrator backs up to carry a machine's
+          identity to a new one.
+\end{verbatim}
+
+\subsection{Users and Data}
+
+\begin{verbatim}
+   /home  the user home directories. /home/alice, /home/bob.
+          Each user's files, dotfiles, and configuration live here.
+          PROBLEM SOLVED: one place for personal data, protected by
+          per-user permissions (Chapter 8).
+
+   /root  the superuser's home. (It is not /home/root, so that root's
+          home is never hidden by a /home mount or an unmount.)
+
+   /var   VARIABLE data -- content that changes while the machine runs:
+          /var/log  (logs, from Chapter 9's daemons),
+          /var/spool (queues: mail, print jobs),
+          /var/cache (caches that can be rebuilt),
+          /var/lib   (stateful data: databases, package state).
+          PROBLEM SOLVED: keeping writable, growing data off the
+          root filesystem so / (or /usr) can stay read-only or be
+          on a smaller, more protected device.
+
+   /tmp   world-writable scratch space. Any process may create files
+          here; the sticky bit (Chapter 8) lets the owner delete them.
+          Cleared on reboot; often its own tmpfs (RAM-backed).
+          PROBLEM SOLVED: a place for throwaway files without a
+          per-user allocation.
+
+   /run   runtime state since the last boot: pids of daemons, sockets,
+          lock files. A tmpfs -- RAM-backed, cleared at reboot.
+          PROBLEM SOLVED: early boot needs state before /var is
+          mounted; /run exists from the first moment.
+
+   /srv   service data: the files web and FTP servers actually serve
+          (/srv/www). Optional, but when used it is the answer to
+          "where does the website live?"
+\end{verbatim}
+
+\subsection{The System Proper}
+
+\begin{verbatim}
+   /usr   "user system resources" -- the BULK of the operating
+          system, and the biggest directory on the disk:
+            /usr/bin       most programs
+            /usr/sbin      most admin tools
+            /usr/lib       most libraries
+            /usr/include   C headers
+            /usr/share     architecture-independent data (docs, icons,
+                           locales, man pages)
+            /usr/local     software installed by the ADMIN, by hand
+                           (a BSD tradition: the distribution owns
+                           /usr; the admin owns /usr/local)
+          PROBLEM SOLVED: /usr used to mean "user files"; when home
+          directories moved to /home, the name stayed and the system
+          software moved in. The merge made /bin a doorway to it.
+
+   /opt   OPTIONAL, third-party software: vendor packages installed as
+          their own trees (/opt/google/, /opt/lampp/).
+          System V tradition, codified by the FHS so commercial
+          software has a place that never collides with the distro's
+          files.
+          PROBLEM SOLVED: "my package must not fight the distribution."
+
+   /boot  what the machine needs BEFORE the OS runs: the kernel
+          (vmlinuz), the initramfs, and the bootloader's files.
+          Often a separate, small, early-read partition.
+          PROBLEM SOLVED: the bootloader and BIOS read this before
+          any filesystem driver exists for the main disk.
+
+   /dev   the DEVICES, as files. /dev/null, /dev/zero, /dev/tty,
+          /dev/sda (your disk), /dev/nvme0n1... Writing to a device
+          file talks to hardware (Chapter 5's "everything is a file").
+          PROBLEM SOLVED: hardware access through the ordinary file
+          interface. udev and devtmpfs create the entries at boot as
+          devices are discovered.
+
+   /mnt   a convention: temporary mount points (a filesystem you are
+          about to inspect, a repair disk). Admins mount things here
+          BY HAND.
+   /media removable media the desktop mounts automatically (USB
+          sticks, CD-ROMs) -- the automatic counterpart of /mnt.
+\end{verbatim}
+
+\subsection{Virtual Filesystems: Two Meanings of ``Virtual''}
+
+The word \emph{virtual filesystem} is used for two related but distinct
+things in Linux, and keeping them apart prevents a lot of confusion.
+
+\begin{verbatim}
+   MEANING 1 -- the VFS layer (the "Virtual File System" switch).
+   This is not a filesystem at all; it is an INTERFACE that every
+   filesystem must implement. The kernel presents one uniform API --
+   open(), read(), write(), stat(), readdir() -- and the VFS hands
+   each call to whichever filesystem the path lives on.
+
+        open()/read()/write()/stat()   (the syscalls of ch.5, ch.8)
+                        |
+                  [ VFS LAYER ]
+                  the one interface
+             /        |       |       \        \
+         ext4      tmpfs    procfs    sysfs    devtmpfs
+         (disk)    (RAM)    (kernel)  (kernel)  (kernel)
+            each implements the SAME operations, differently
+
+   THIS is the mechanism behind "everything is a file": /dev/null,
+   a pipe, an ext4 file, and /proc/meminfo all answer the same
+   syscalls because the VFS defines one contract and every
+   filesystem fulfills it.
+
+   MEANING 2 -- filesystems with no disk behind them
+   (also called PSEUDO-filesystems). Here "virtual" means: the files
+   do not exist on any storage device. Their contents are either
+   generated on the fly by the kernel (proc, sysfs) or are just RAM
+   (tmpfs, devtmpfs). Read /proc/meminfo and the kernel formats its
+   memory tables into text at that moment; there is no file to back
+   it up. They live only in RAM and vanish at reboot.
+
+   The two meanings meet: pseudo-filesystems (meaning 2) are simply
+   filesystems that implement the VFS interface (meaning 1) without
+   a storage device.
+\end{verbatim}
+
+When Chapter~8 called \code{/proc} a \emph{virtual filesystem}, it was
+using meaning 2: files whose bytes are produced on demand. When kernel
+documentation talks about \emph{the VFS}, it means meaning 1: the
+abstraction layer that makes every kind of filesystem interchangeable.
+Both are operating system inventions, and both are why your C program
+can treat a kernel statistic and a disk file with the same
+\code{open}/\code{read}/\code{close} code.
+
+\begin{osconcept}
+The VFS is the OS's plug-in architecture for storage. By defining one
+interface and making every filesystem implement it, the kernel lets a
+single set of system calls serve disks, RAM, and the kernel's own
+internals. Pseudo-filesystems push the idea to its limit: there is no
+``storage'' at all, just kernel state rendered as paths. Both exist
+because only the kernel can route a syscall to the right implementation
+and manufacture ``files'' from its own data structures.
+\end{osconcept}
+
+\begin{verbatim}
+   /proc  the PROCESS and kernel view, as files -- generated on the
+          fly when you read them (Chapter 8). /proc/self/status,
+          /proc/cpuinfo, /proc/mounts, /proc/<pid>/... Nothing here
+          is stored; it is the kernel's data structures rendered as
+          a filesystem.
+
+   /sys   the DEVICE MODEL and kernel parameters, as files. /sys/class,
+          /sys/devices, /sys/module... the modern, structured sibling
+          of /proc. Writing certain files changes kernel behavior
+          ("echo 1 > /sys/.../unload").
+
+   /dev   (listed above) is the third kernel interface: device nodes,
+          maintained by udev. All three are VIRTUAL: no disk, no
+          persistence, just the file abstraction over kernel state.
+\end{verbatim}
+
+\begin{verbatim}
+   The five virtual / kernel filesystems, in one table:
+
+     mount     type       backed by        holds
+     ------    ---------  ---------------  --------------------------
+     /         ext4       the real disk    the tree's home
+     /proc     proc       kernel RAM       processes + kernel info
+     /sys      sysfs      kernel RAM       the device model
+     /dev      devtmpfs   kernel RAM       device nodes
+     /tmp, /run, /dev/shm tmpfs           RAM (page-backed)
+
+   "tmpfs" = a filesystem whose storage is RAM pages; it exists while
+   the machine runs and vanishes at reboot. That is why /run and /tmp
+   are always empty after a clean boot.
+\end{verbatim}
+
+\begin{osconcept}
+These directories are not decoration; they are the OS's own
+bookkeeping made visible. \code{/proc}, \code{/sys}, and \code{/dev}
+are the kernel exposing its internals through the file abstraction---
+the same design choice as Chapter~8's virtual filesystem, taken to the
+whole system. \code{tmpfs} shows the kernel serving RAM as a
+filesystem. Reading the tree is reading the kernel.
+\end{osconcept}
+
+\section{The Problem the Tree Solves}
+
+With every directory explained, the question ``why does this layout
+exist at all?'' has a four-part answer:
+
+\begin{verbatim}
+   1. COORDINATION.  A standard layout is an agreement. A program can
+      assume /etc/passwd, /usr/include/stdio.h, /var/log exist and
+      mean the same thing on every distribution. Without the FHS,
+      every package would need a per-distro install script.
+
+   2. SEPARATION OF CONCERNS.  Read-only vs writable (/usr vs /var),
+      essential vs optional (/bin vs /opt), static vs stateful
+      (/usr/share vs /var/lib), software vs configuration (/usr vs
+      /etc). Each split is a different backup, mount, and permission
+      policy.
+
+   3. REPAIRABILITY.  The root-vs-usr split's fossil: a minimal,
+      bootable, recoverable core exists even when the big filesystem
+      is broken. /boot preserves the same idea for the bootloader.
+
+   4. SHARED MACHINERY.  One namespace means one set of tools: find,
+      ls, tar, rsync -- and every program in this book -- work on
+      disks, devices, and kernel interfaces alike, because they are
+      all files.
+\end{verbatim}
+
+\begin{ruleofthumb}[Let the layout answer the question for you]
+When you wonder where a file belongs, ask \emph{what kind of thing it
+is}: configuration goes in \code{/etc}, variable data in
+\code{/var}, software in \code{/usr} or \code{/opt}, scratch in
+\code{/tmp}. The tree is a decision procedure, and following it keeps
+your programs portable and your system repairable.
+\end{ruleofthumb}
+
+\section{Practical: A Filesystem Tourist}
+
+Let us build a small tool that walks the root with the directory API
+of Chapter~8 and labels each top-level entry with its type---a
+machine-readable version of the tree at the top of this chapter.
+Everything here is code you already know: \code{opendir},
+\code{readdir}, \code{lstat}, and the \code{S\_IS*} macros.
+
+\begin{lstlisting}[caption={fstree.c: walk / and label each top-level entry.}]
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <dirent.h>
+#include <sys/stat.h>
+
+/* One-letter label for the file type, as in ls -l (Chapter 8). */
+static char type_char(mode_t mode) {
+    if (S_ISDIR(mode))  return 'd';
+    if (S_ISLNK(mode))  return 'l';
+    if (S_ISREG(mode))  return '-';
+    if (S_ISCHR(mode))  return 'c';
+    if (S_ISBLK(mode))  return 'b';
+    if (S_ISFIFO(mode)) return 'p';
+    if (S_ISSOCK(mode)) return 's';
+    return '?';
+}
+
+/* Print the type and name of every entry in one directory. */
+static void tour(const char *path) {
+    DIR *d;
+    struct dirent *e;
+
+    d = opendir(path);
+    if (d == NULL) {
+        perror("opendir");
+        return;
+    }
+
+    while (1) {
+        struct stat st;
+        char full[1024];
+        int plen;
+
+        e = readdir(d);
+        if (e == NULL) {
+            break;
+        }
+        if (e->d_name[0] == '.') {
+            continue;          /* skip . and .. */
+        }
+
+        plen = snprintf(full, sizeof(full), "%s/%s", path, e->d_name);
+        if (plen < 0 || plen >= (int) sizeof(full)) {
+            continue;
+        }
+
+        if (lstat(full, &st) < 0) {
+            continue;
+        }
+
+        printf("%c %s\n", type_char(st.st_mode), e->d_name);
+    }
+
+    closedir(d);
+}
+
+int main(int argc, char *argv[]) {
+    const char *root;
+
+    root = (argc >= 2) ? argv[1] : "/";
+    printf("type  entry  (under %s)\n", root);
+    tour(root);
+    return 0;
+}
+\end{lstlisting}
+
+\begin{verbatim}
+   $ ./fstree
+   type  entry  (under /)
+   d bin
+   d boot
+   d dev
+   d etc
+   d home
+   d lib
+   d media
+   d mnt
+   d opt
+   d proc
+   d root
+   d run
+   d sbin
+   d srv
+   d sys
+   d tmp
+   d usr
+   d var
+
+   On a system with the usr-merge, ls -l /bin reveals the history at a
+   glance: l bin -> usr/bin. The 1971 split has become a symlink.
+\end{verbatim}
+
+\begin{researchnote}[The tree's constitution]
+The Filesystem Hierarchy Standard is the document this chapter has
+been quoting, and it is worth reading from the source. The current
+edition, FHS 3.0, published by the Linux Foundation in 2015, specifies
+the layout precisely enough that a distribution can be checked against
+it mechanically---which is exactly what makes cross-distribution
+software possible.
+
+\begin{verbatim}
+   The FHS's stated purpose, condensed from its own preface:
+
+       "The filesystem hierarchy standard describes a conventional
+        layout that allows software to predict where its files and
+        data reside, so that software can be written to work on any
+        conforming system."
+
+   Every table in this chapter--/bin vs /usr/bin, /etc for
+   configuration, /var for variable data--is the FHS made flesh. It is
+   a rare thing: a standard that is simultaneously bureaucratic and
+   load-bearing.
+\end{verbatim}
+
+Reading the FHS straight through is the fastest way to cement this
+chapter: it is short, unambiguous, and each entry is the "problem
+solved" text of Section 15.4 in its most careful form.
+
+\paperref{Filesystem Hierarchy Standard, Version 3.0, Linux Foundation,
+2015}{https://refspecs.linuxfoundation.org/FHS_3.0/fhs-3.0.pdf}
+\end{researchnote}
+
+\section{Structures in Bytes}
+
+The hierarchy's byte structures are mostly on disk. A symbolic link is
+the simplest: its data bytes are the target path.
+
+\begin{verbatim}
+   symlink "data_soft.txt" -> "data.txt"
+
+   inode (mode = symlink)      data
+   +-----------------+         +-------------+
+   | size = 8        |-------->| "data.txt\0" |   8 bytes + NUL
+   +-----------------+         +-------------+
+\end{verbatim}
+
+The ext4 superblock (1024 bytes, at offset 1024 of the partition)
+holds the fields the kernel reads to mount a filesystem:
+
+\begin{verbatim}
+   ext4 superblock, key offsets:
+
+   offset  size  field
+   0       4     s_inodes_count
+   4       4     s_blocks_count
+   20      4     s_log_block_size    (block size = 1024 << this)
+   56      2     s_magic             (0xEF53 marks a real ext4)
+   88      2     s_inode_size        (256 on ext4)
+\end{verbatim}
+
+And \code{/proc/mounts} renders the kernel's mount table as text---one
+line per mount, each field separated by spaces:
+
+\begin{verbatim}
+   /dev/sda1 / ext4 rw,relatime 0 0
+   ^device   ^mount point ^fstype ^options ^dump ^pass
+\end{verbatim}
+
+Everything the tree is built from---inodes, superblocks, mount
+records---is bytes; the hierarchy is the names that point at them.
+
+\section{Summary}
+
+\begin{verbatim}
+   The filesystem hierarchy, in one paragraph:
+
+   one tree from / ; every device, device-node, and kernel interface
+   hangs on it at a MOUNT POINT; the layout is a 1971 fossil (bin vs
+   usr, /etc) standardized by the FHS (coordination, separation,
+   repairability) and modernized by the usr-merge and /run.
+
+   The directories as a decision procedure:
+     configuration  /etc      variable data  /var
+     software       /usr,/opt scratch        /tmp
+     users          /home     admin          /sbin,/root
+     boot           /boot     services       /srv
+     hardware       /dev      kernel         /proc,/sys
+     mounting       /mnt,/media
+
+   Rules that keep you oriented:
+     1. ls -l /bin is worth doing once on your own machine: the
+        history is visible in the symlinks;
+     2. /proc/mounts tells you what the tree is built from;
+     3. when in doubt about where a file belongs, follow the FHS's
+        "what kind of thing is it?" question.
+\end{verbatim}
+
+\begin{osconcept}
+The hierarchy is the OS's address book made public. It works only
+because the kernel owns mounting, only because virtual filesystems let
+the kernel render itself as paths, and only because a standard keeps
+the agreement stable across distributions. This chapter sat between
+the code you have written and the machine it runs on: the tree is
+where every path in every earlier chapter actually lived.
+\end{osconcept}
+
+The tour is complete. The next chapter returns to writing code and
+builds the machine's other great promise: durable storage. We design a
+wire format, append and replay a log, and make data survive a
+crash---before the final chapter carries it across the network.
+

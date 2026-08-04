@@ -1,0 +1,599 @@
+% ============================================================================
+%  chapter12.tex
+%  Shared Memory and Memory Mapping
+% ============================================================================
+
+\chapter{Shared Memory and Memory Mapping}
+
+\section{The Boldest Abstraction: Memory That Is a File}
+
+Every chapter since the first has treated the address space as a
+container of bytes you own. This chapter changes the deal with one
+call: \code{mmap}, which \emph{maps} a file---or a region of anonymous
+memory---\emph{into your address space}. After the call, reading a
+file is just reading memory: \code{p[i]}, not \code{read(fd, ...)}.
+And when several processes map the same object as \emph{shared}, they
+see the \emph{same physical pages}---shared memory, with no pipe, no
+copy, and no kernel involvement in each transfer.
+
+\begin{verbatim}
+   The two faces of mmap:
+
+   FILE MAPPING:                    SHARED MEMORY:
+   a file's bytes appear in         two (or more) processes map the
+   your address space.              same region; they share pages.
+
+        address space               process A         process B
+   +----------------------+         +--------+        +--------+
+   |  [ p[0] ][ p[1] ]... |         | shared |<======>| shared |
+   |    (the file)        |         | pages  |        | pages  |
+   +----------------------+         +--------+        +--------+
+        ^                             ^ same physical RAM
+        | mmap
+   +----------------------+
+   |   the file on disk   |
+   +----------------------+
+
+   Reading the file = dereferencing the pointer.
+   Writing the file = assigning through the pointer.
+   Sharing between processes = both mapping the same thing SHARED.
+\end{verbatim}
+
+To understand why this works---and why it is fast---you need the
+virtual-memory model of Chapter~1 in its full form: the address space
+is divided into \emph{pages} (4~KB on our machines), and the CPU
+translates page-by-page through the \emph{page table}. \code{mmap}
+does not copy the file into memory. It merely \emph{points the page
+table} at the file's pages. The first access to a page triggers a
+\emph{page fault}; the kernel then reads that one page from the file
+into RAM, lazily, on demand.
+
+\begin{osconcept}
+mmap unifies the two great abstractions of this book---virtual memory
+and the file system---into one: \emph{the address space becomes a view
+of an object}. The OS maps files lazily, page by page, and shares
+physical pages between processes by pointing multiple page tables at
+them. Only the kernel can do this, because only the kernel owns the
+page tables and the files. Your program just gets a pointer.
+\end{osconcept}
+
+\section{mmap: The Call}
+
+\code{mmap} takes six arguments and returns a pointer into your address
+space (or \code{MAP\_FAILED}, which is \code{(void *) -1}, not
+\code{NULL}). The size must be in bytes, and the kernel works in
+pages---a region is rounded up to whole pages whether you like it or
+not.
+
+\begin{lstlisting}[caption={Reading a whole file by mapping it.}]
+#include <stdio.h>
+#include <stdlib.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+int main(int argc, char *argv[]) {
+    int fd;
+    struct stat st;
+    const unsigned char *p;
+    size_t i;
+
+    if (argc != 2) {
+        fprintf(stderr, "usage: %s file\n", argv[0]);
+        return 1;
+    }
+
+    fd = open(argv[1], O_RDONLY);
+    if (fd < 0) {
+        perror("open");
+        return 1;
+    }
+    if (fstat(fd, &st) < 0) {
+        perror("fstat");
+        return 1;
+    }
+
+    p = mmap(NULL, (size_t) st.st_size, PROT_READ,
+             MAP_PRIVATE, fd, 0);
+    if (p == MAP_FAILED) {
+        perror("mmap");
+        return 1;
+    }
+
+    /* The whole file is in our address space: just print it. */
+    for (i = 0; i < (size_t) st.st_size; i++) {
+        putchar(p[i]);
+    }
+
+    munmap((void *) p, (size_t) st.st_size);
+    close(fd);
+    return 0;
+}
+\end{lstlisting}
+
+The arguments, each doing one job:
+
+\begin{verbatim}
+   mmap( addr, length, prot, flags, fd, offset )
+        |     |       |     |       |    |
+        |     |       |     |       |    +-- start mapping at this file
+        |     |       |     |       |         offset (usually 0)
+        |     |       |     |       +-- the descriptor, or -1 for
+        |     |       |     |            an anonymous mapping
+        |     |       |     +-- MAP_SHARED  (visible to others)
+        |     |       |          MAP_PRIVATE (private copy, COW)
+        |     |       +-- PROT_READ / PROT_WRITE / PROT_EXEC
+        |     +-- length in BYTES (rounded up to pages)
+        +-- NULL = let the kernel choose the address (almost always)
+
+   munmap(ptr, length)  undoes it, exactly once, when you are done.
+\end{verbatim}
+
+\begin{verbatim}
+   The lazy mapping, drawn:
+
+      time 0: mmap() succeeds -- NOTHING is loaded yet.
+              file:     [p0][p1][p2][p3][p4]
+              address:  [    mapped, but empty pages    ]
+
+      time 1: you touch p[0]. The CPU page-faults; the kernel loads
+              page 0 from the file into RAM; your read completes.
+
+              file:     [p0][p1][p2][p3][p4]
+              address:  [p0][    empty    ]   <- only p0 loaded
+
+      Each first touch of a page is a fault and one disk read.
+      Unused pages cost nothing -- the mapping is a promise, not a
+      copy. This is why mapping a 1 GB file can succeed instantly.
+\end{verbatim}
+
+\begin{osconcept}
+The laziness of mmap is demand paging, and it is pure OS machinery.
+The page table starts pointing at ``not present,'' the CPU raises a
+fault on first touch, and the kernel satisfies that one page from the
+file. Your program cannot do this itself; it has no page table. The
+OS is betting that you will not touch every byte, and when you do, it
+reads only what you actually use.
+\end{osconcept}
+
+\section{Anonymous Mappings}
+
+An \emph{anonymous} mapping has no file behind it: the kernel provides
+zeroed memory that behaves like an array, and---with
+\code{MAP\_SHARED}---can be shared between processes. It is the
+modern way to allocate shared memory, and the honest way to get a
+big private buffer too (the \code{malloc} of Chapter~13 is built on
+it).
+
+\begin{lstlisting}[caption={A shared counter visible to a forked child.}]
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#include <sys/wait.h>
+
+int main(void) {
+    long *counter;
+    pid_t pid;
+
+    /* One shared page of anonymous memory, writable by all. */
+    counter = mmap(NULL, sizeof(long),
+                   PROT_READ | PROT_WRITE,
+                   MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (counter == MAP_FAILED) {
+        perror("mmap");
+        return 1;
+    }
+    *counter = 0;
+
+    pid = fork();
+    if (pid < 0) {
+        perror("fork");
+        return 1;
+    }
+
+    if (pid == 0) {
+        /* Child: add 100 to the SHARED counter. */
+        int i;
+
+        for (i = 0; i < 100; i++) {
+            *counter = *counter + 1;
+        }
+        _exit(0);
+    }
+
+    /* Parent: wait, then read what the child wrote. */
+    waitpid(pid, NULL, 0);
+    printf("counter = %ld (child added 100)\n", *counter);
+
+    munmap(counter, sizeof(long));
+    return 0;
+}
+\end{lstlisting}
+
+\begin{verbatim}
+   What sharing means here, page by page:
+
+     before fork:   ONE mapping, ONE physical page.
+     after fork:    the child inherits the mapping. Because it is
+                    MAP_SHARED, BOTH processes' page tables point at
+                    the SAME physical page.
+
+     parent: [p] --->  shared page: [ 100 ]  <--- [p] : child
+                            ^ same physical RAM
+
+   The child's writes are visible to the parent -- not by copying,
+   but because they write the very same bytes. No pipe, no kernel
+   buffer, no copy: the fastest possible IPC.
+\end{verbatim}
+
+The price of that speed is exactly the theme of this book: shared
+writes race. Two processes incrementing the same counter without a
+lock lose increments, precisely as two threads did in Chapter~11. The
+difference is that now the lock itself must live \emph{in the shared
+region}, so both processes can reach it.
+
+\begin{osconcept}
+Sharing physical pages is the kernel's greatest privilege: multiple
+processes, one piece of RAM, no copying, no serialization. It is also
+a deliberate risk, because the kernel cannot police how you use the
+bytes---a shared pointer is a shared pointer. The OS provides the
+sharing and the synchronization primitives; using them safely is, as
+ever, the programmer's contract.
+\end{osconcept}
+
+\section{MAP\_SHARED vs MAP\_PRIVATE}
+
+The \code{flags} argument is the one that decides what a \emph{write}
+does. This is the crux of the whole mechanism:
+
+\begin{verbatim}
+   MAP_PRIVATE   -- the mapping is private to this process.
+                     Writes are copy-on-write: the first time this
+                     process writes a page, the kernel gives it a
+                     PRIVATE COPY, and all further writes touch only
+                     the copy. The file (or the other processes) are
+                     NOT changed.
+
+   MAP_SHARED    -- the mapping is shared.
+                     Writes go straight to the underlying object:
+                     the file on disk for a file mapping, or the
+                     shared physical pages for everyone else mapping
+                     the same region.
+
+   The rule of thumb: PRIVATE to read a file without changing it;
+   SHARED to edit a file in place or to communicate between
+   processes.
+\end{verbatim}
+
+\begin{verbatim}
+   COPY-ON-WRITE for MAP_PRIVATE, drawn:
+
+     before any write:                 after the first write to page 0:
+
+     [p0][p1][p2][p3]   (all shared     [p0'](copy)[p1][p2][p3]
+        |      with the file)             |        still shared
+        +-- the file's pages             +-- this page is now private
+
+   The cost model: reads are free until the pages change; writes cost
+   one copy per page, only for pages you actually modify. That is why
+   MAP_PRIVATE is the safe default for reading.
+\end{verbatim}
+
+For a \emph{shared file} mapping, your writes modify the file's
+contents in place---exactly what an editor or a database wants. The
+\emph{msync} call pushes the modified pages out to the storage medium
+now, rather than waiting for the kernel's background flush. Think of
+it as \code{fsync} for a mapping.
+
+\begin{lstlisting}[caption={msync: flush a shared mapping to disk.}]
+#include <sys/mman.h>
+
+/* Write the mapped bytes back to the file immediately. */
+int flush_mapping(void *addr, size_t length) {
+    int r;
+
+    r = msync(addr, length, MS_SYNC);   /* MS_ASYNC = don't wait */
+    if (r < 0) {
+        return -1;
+    }
+    return 0;
+}
+\end{lstlisting}
+
+\begin{osconcept}
+The shared/private distinction is kernel policy with teeth. PRIVATE
+asks the OS for copy-on-write: the kernel re-points one page at a
+fresh copy at the moment of the first write, invisibly and
+atomically. SHARED asks the OS to make every write land on the same
+physical pages (and, for files, eventually on disk). Choosing between
+them is choosing between isolation and communication, and the kernel
+enforces that choice per page.
+\end{osconcept}
+
+\section{Synchronizing Shared Memory}
+
+Shared memory is fast because there is no kernel in the data path---
+which is precisely why there is no kernel in the \emph{coordination}
+path either. Two processes that share a counter must synchronize
+themselves, with a lock that lives in the shared region. Pthreads
+mutexes can do this, but only if told they are \emph{process-shared}:
+by default a mutex is only usable by threads of one process.
+
+\begin{lstlisting}[caption={A process-shared mutex guarding shared memory.}]
+#include <stdio.h>
+#include <stdlib.h>
+#include <pthread.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#include <sys/wait.h>
+
+typedef struct shared {
+    pthread_mutex_t lock;    /* must live IN the shared region */
+    long counter;
+} shared;
+
+int main(void) {
+    shared *s;
+    pthread_mutexattr_t attr;
+    pid_t pid;
+    int i;
+
+    s = mmap(NULL, sizeof(shared),
+             PROT_READ | PROT_WRITE,
+             MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (s == MAP_FAILED) {
+        perror("mmap");
+        return 1;
+    }
+
+    /* Declare the mutex usable by ANY process (PTHREAD_PROCESS_SHARED). */
+    pthread_mutexattr_init(&attr);
+    pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED);
+    pthread_mutex_init(&s->lock, &attr);
+    pthread_mutexattr_destroy(&attr);
+
+    s->counter = 0;
+
+    pid = fork();
+    if (pid < 0) {
+        perror("fork");
+        return 1;
+    }
+
+    if (pid == 0) {
+        /* Child increments 1000 times, safely. */
+        for (i = 0; i < 1000; i++) {
+            pthread_mutex_lock(&s->lock);
+            s->counter = s->counter + 1;
+            pthread_mutex_unlock(&s->lock);
+        }
+        _exit(0);
+    }
+
+    /* Parent increments 1000 times, safely. */
+    for (i = 0; i < 1000; i++) {
+        pthread_mutex_lock(&s->lock);
+        s->counter = s->counter + 1;
+        pthread_mutex_unlock(&s->lock);
+    }
+
+    waitpid(pid, NULL, 0);
+    printf("counter = %ld (expected 2000)\n", s->counter);
+
+    pthread_mutex_destroy(&s->lock);
+    munmap(s, sizeof(shared));
+    return 0;
+}
+\end{lstlisting}
+
+\begin{verbatim}
+   The layout that makes it work:
+
+     shared region (one anonymous mapping):
+     +---------------------------------------------+
+     | pthread_mutex_t lock   |  long counter      |
+     +---------------------------------------------+
+            ^ mapped into BOTH processes' address spaces
+
+     process A:  s->lock, s->counter   (the very same bytes)
+     process B:  s->lock, s->counter   (the very same bytes)
+
+   The mutex's memory is shared, so the kernel can see both
+   processes contending for it. WITHOUT setpshared(...PROCESS_SHARED),
+   the mutex would still be in shared memory but declared private, and
+   its behavior would be undefined -- two processes, one lock, no
+   contract.
+\end{verbatim}
+
+\begin{osconcept}
+A mutex is kernel state, and making it process-shared is an explicit
+kernel decision (\code{PTHREAD\_PROCESS\_SHARED}) so the OS knows the
+lock may be contended across processes, not just threads. The
+primitive is the same; only its scope changes. Shared memory without
+such a lock is a data race across a process boundary---undefined
+behavior with an even bigger blast radius than the thread races of
+Chapter~11.
+\end{osconcept}
+
+\section{Practical: Editing a File Through a Mapping}
+
+Let us close with the file-backed side of mmap: a program that treats
+a file as an array of integers, edits it through the mapping, and
+flushes the result to disk. This is the exact technique used by
+databases, key-value stores, and editors to modify large files in
+place without a single \code{lseek}.
+
+\begin{lstlisting}[caption={mmapfile.c: the file as an array of ints.}]
+#include <stdio.h>
+#include <stdlib.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+#define NINTS 8
+
+int main(int argc, char *argv[]) {
+    int fd;
+    int *vals;
+    size_t bytes;
+    size_t i;
+
+    if (argc != 2) {
+        fprintf(stderr, "usage: %s file\n", argv[0]);
+        return 1;
+    }
+
+    /* Open (or create) the file read-write. */
+    fd = open(argv[1], O_RDWR | O_CREAT, 0644);
+    if (fd < 0) {
+        perror("open");
+        return 1;
+    }
+
+    /* Size the file to hold NINTS ints before mapping it. */
+    bytes = NINTS * sizeof(int);
+    if (ftruncate(fd, (off_t) bytes) < 0) {
+        perror("ftruncate");
+        return 1;
+    }
+
+    /* Map the whole thing, writable and shared. */
+    vals = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (vals == MAP_FAILED) {
+        perror("mmap");
+        return 1;
+    }
+
+    /* Write through the mapping: no write(), no lseek. */
+    for (i = 0; i < NINTS; i++) {
+        vals[i] = (int) (i * i);
+    }
+
+    /* Flush now (optional: the kernel would flush eventually). */
+    msync(vals, bytes, MS_SYNC);
+
+    printf("wrote %zu ints through the mapping:\n", NINTS);
+    for (i = 0; i < NINTS; i++) {
+        printf("  vals[%zu] = %d\n", i, vals[i]);
+    }
+
+    munmap(vals, bytes);
+    close(fd);
+    return 0;
+}
+\end{lstlisting}
+
+\begin{verbatim}
+   Why this is a different way to do I/O:
+
+     classic path:   write(fd, buf, n)  -- a syscall, kernel copies
+     mmap path:      vals[i] = v;       -- a store instruction; the
+                        kernel's page-fault machinery moves the bytes
+                        to disk when it must
+
+   The trade-off in one line: mmap removes the copy into and out of
+   the kernel for random-access edits, at the price of page-fault
+   costs on first touch and giving the kernel control over when the
+   data actually reaches disk.
+\end{verbatim}
+
+\begin{researchnote}[The theory behind memory-mapped I/O]
+mmap is not a trick; it is virtual memory applied to files, and the
+theory behind virtual memory is one of computing's foundational
+results. In 1970, Peter Denning published ``Virtual Memory''---the
+survey that consolidated paging, page tables, and demand loading into
+the coherent model this chapter relies on.
+
+\begin{verbatim}
+   Denning's framing, condensed:
+
+       "Virtual memory allows programs to run as if they occupied
+        far more memory than is physically present, by moving pages
+        between main memory and secondary storage on demand."
+
+   Read that with mmap in mind: mapping a 1 GB file with 4 GB of RAM
+   is exactly this promise. The file IS the backing store; the page
+   fault is the demand; and your pointer is the program's illusion of
+   having the whole file in memory.
+\end{verbatim}
+
+Denning's survey is a beautifully written summary of why the page
+model works, and it explains the behavior of every mmap program you
+will ever write---the lazy first touch, the copy-on-write, the
+page-sized granularity. When you wonder ``why is my mapping so
+fast?,'' the answer was published in 1970.
+
+\paperref{P.~J.~Denning, ``Virtual Memory,'' ACM Computing Surveys
+2(3), 1970}{https://dl.acm.org/doi/10.1145/356638.356640}
+\end{researchnote}
+
+\section{Structures in Bytes}
+
+The unit of shared memory is the page, and the structure that makes it
+work is the page-table entry (PTE)---8 bytes on x86-64.
+
+\begin{verbatim}
+   a page: 4096 bytes = 512 eight-byte words.
+
+   a page-table entry, the 8 bytes that name a page:
+
+   bit   0   present           (0 here means "page fault")
+   bit   1   writable
+   bit   2   user-accessible
+   bits  3-11  more flags      (dirty, accessed, ...)
+   bits 12-51  physical frame number   <- where the page really lives
+   bits 52-62  available to the kernel
+   bit  63   NX                (no-execute)
+
+   the four-level walk for a 48-bit address:
+   CR3 -> PML4 -> PDPT -> PD -> PT -> 4 KB page
+   (each level is a page of 512 eight-byte entries)
+\end{verbatim}
+
+\code{mmap} mostly writes entries into these tables: an anonymous
+mapping installs ``not present'' entries that fault in zeroed pages; a
+\code{MAP\_SHARED} mapping points several processes' PTEs at the same
+physical frame number. The ``structure in bytes'' of shared memory is
+ultimately this: one 8-byte entry with the same frame number sitting in
+two page tables.
+
+\section{Summary}
+
+\begin{verbatim}
+   The mapping toolbox, complete:
+
+   mmap(0, len, prot, flags, fd, off)   map a file or anonymous memory
+   munmap(ptr, len)                     unmap it exactly once
+   MAP_PRIVATE                          copy-on-write: private edits
+   MAP_SHARED                           shared pages / edit the file
+   MAP_ANONYMOUS                        no file: zeroed shared memory
+   MAP_FAILED                           the error sentinel (never NULL)
+   page fault                           lazy per-page load on first touch
+   msync(ptr, len, MS_SYNC)             flush a shared mapping to disk
+   PTHREAD_PROCESS_SHARED               a mutex shared across processes
+
+   Rules that keep mapping code correct:
+     1. size a file with ftruncate BEFORE mapping it;
+     2. check against MAP_FAILED, not NULL;
+     3. pair every mmap with exactly one munmap;
+     4. MAP_PRIVATE to read, MAP_SHARED to edit or communicate;
+     5. protect shared memory with a process-shared mutex.
+\end{verbatim}
+
+\begin{osconcept}
+This chapter closed a loop opened in Chapter~1. The address space,
+we said, is the process's view of memory; mmap shows it is a view of
+\emph{anything the kernel can page}---files, devices, or zeroed
+anonymous regions. Sharing physical pages is the fastest and most
+dangerous IPC there is, and the kernel provides both the mapping and
+the locks, leaving the discipline to you. Nothing in this book
+rewards understanding the machine more.
+\end{osconcept}
+
+We have built data structures, processes, servers, and shared memory.
+The next chapter brings it all into one library: the memory
+allocator---the code that hands out and reclaims every byte of the
+heap, and the performance cliffs that hide inside \code{malloc}.
+

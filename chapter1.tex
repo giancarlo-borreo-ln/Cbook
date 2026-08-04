@@ -1,0 +1,1057 @@
+% ============================================================================
+%  chapter1.tex
+%  The Foundations of Memory and Pointers
+% ============================================================================
+
+\chapter{The Foundations of Memory and Pointers}
+
+\section{The Machine Underneath}
+
+Before we talk about C, we must talk about the machine. Everything a
+computer does reduces to a staggeringly simple model: there is a large
+array of bytes, each byte has a number (its \emph{address}), and the
+processor runs a loop that reads instructions from memory and acts on
+them. The CPU has no understanding of ``variables'', ``strings'', or
+``objects''. It understands \emph{addresses} and \emph{bytes}. When we
+write C, we are simply describing, with a thin layer of sugar, what the
+machine will actually do.
+
+This is the heart of the Sanfilippo approach to C: we never hide the
+machine from the student. If you understand bytes, addresses, and
+lifetimes, then every higher-level concept---data structures, network
+servers, databases, virtual machines---is just a disciplined arrangement
+of these three ideas. If you skip this foundation, every later chapter
+will feel like magic, and magic breaks in production.
+
+Let us begin with the smallest unit of storage the CPU can address
+directly: the \emph{byte}.
+
+\begin{verbatim}
+   A byte is 8 bits. Each bit is a switch: 0 (off) or 1 (on).
+
+   Address 0x7ffe29a00000:
+
+        +---+---+---+---+---+---+---+---+
+        | 0 | 1 | 0 | 0 | 0 | 0 | 1 | 1 |   = 0x43 = 67 = ASCII 'C'
+        +---+---+---+---+---+---+---+---+
+         bit7 bit6 bit5 bit4 bit3 bit2 bit1 bit0
+
+        bit0 has value 1 (2^0), bit1 has value 2 (2^1),
+        bit2 has value 4 (2^2), and so on, up to bit7 = 128.
+        This byte represents the number 64 + 2 + 1 = 67.
+\end{verbatim}
+
+Every byte in the address space has a unique address. On x86-64 the
+implemented virtual address space is actually numbered from $0$ to
+$2^{48}-1$ (or to $2^{57}-1$ with five-level paging); the 64-bit register width
+would allow $2^{64}$, but the hardware does not implement that full range. Either
+way, it is so large that we will never fill it. We write addresses in hexadecimal
+because it maps cleanly onto groups of four bits, and because writing
+$2^{64}$ as decimal numbers is a waste of human attention.
+
+\begin{insight}[Why hexadecimal]
+A byte is two hexadecimal digits. One hex digit is four bits---a
+\emph{nibble}, half a byte. That is
+why \code{0x43} reads like a byte: \code{0x} is the prefix, \code{4} is
+the high nibble, \code{3} is the low nibble. When you see a memory
+dump, you can mentally group it into bytes by pairs of digits.
+\end{insight}
+
+\subsection{Bits, Bytes, and Words}
+
+Three sizes will keep recurring, so let us settle them now. A
+\emph{bit} is one switch, 0 or 1. A \emph{byte} is eight bits and is
+the smallest addressable unit. A \emph{word} is the machine's
+\emph{natural unit of data}: the size of a general-purpose register,
+and the size the CPU prefers to load and store in one operation.
+
+\begin{verbatim}
+   The three units, drawn to scale:
+
+     a bit:        a byte (8 bits):        a word (a register):
+                   1 0 1 1 0 0 1 0
+     +---+          +---+---+---+---+---+---+---+---+       +---------------+
+     | 1 |          | 1 | 0 | 1 | 1 | 0 | 0 | 1 | 0 |       |   0x00000043  |
+     +---+          +---+---+---+---+---+---+---+---+       +---------------+
+                                            ^
+                                            ^   four bytes grouped:
+                                                the natural 64-bit word
+                                                = 0x0000000000000043
+
+   On a 64-bit machine, one word is 8 bytes and holds up to 2^64
+   different values -- enough to address every byte in the address
+   space. That is no coincidence: a POINTER is exactly one word.
+\end{verbatim}
+
+The word size is the machine's identity, and it has consequences you
+will feel all book long:
+
+\begin{itemize}
+  \item A \emph{pointer} is one word. On a 32-bit machine pointers are
+    4 bytes; on a 64-bit machine they are 8. That is why
+    \code{sizeof(int *)} printed 8 in Chapter~1's table, and why the
+    address space is $2^{64}$ bytes on modern systems.
+  \item The CPU likes \emph{aligned} access: reading a word from an
+    address divisible by the word size is fastest; straddling a
+    boundary costs extra. Alignment, and the padding it forces into
+    structs, is the subject of Chapter~3.
+  \item The word survives in our vocabulary: a \emph{double word} is
+    two words, hex dumps are laid out in words, and ``word size'' is
+    how we say ``how wide is this machine?''.
+\end{itemize}
+
+\begin{verbatim}
+   Quick sanity check -- every claim above in one line:
+
+     64-bit machine   word = 8 bytes   pointer = 8 bytes
+     32-bit machine   word = 4 bytes   pointer = 4 bytes
+     sizeof(int *) always equals sizeof(void *) on any one machine:
+     both are one word, whatever that word is.
+\end{verbatim}
+
+\begin{insight}[Why we say "byte" and not "word" for addresses]
+The CPU addresses memory by \emph{byte}, not by word: consecutive
+addresses differ by one byte. Words are built from bytes at aligned
+addresses. So while a register moves one word at a time, an address
+still names one byte---and pointer arithmetic from Chapter~1 works in
+units of the pointed-to type, not in words. Both facts are true at
+once: bytes are addressable, words are natural.
+\end{insight}
+
+\subsection{Registers, Cache, and RAM: The Memory Hierarchy}
+
+Between the CPU and the huge, slow RAM we have been assuming sits
+something your code never sees but that decides how fast it runs:
+the \emph{memory hierarchy}. Access to a byte is not uniform. The CPU
+keeps a handful of registers (fastest, tiny), then one or more
+\emph{caches} (fast, medium-sized), then RAM (slower, huge), then
+disk (far slower, enormous). Each level holds a copy of data that the
+next level up is using, in blocks.
+
+\begin{verbatim}
+   The hierarchy, with the "distance from the CPU":
+
+     level      size      speed        managed by
+     -------    -------   ----------   ---------------
+     registers   ~100s B   ~1 ns        the program (you!)
+     L1 cache     ~32 KB    ~1 ns       the CPU, automatically
+     L2 cache    ~256 KB    ~3 ns       the CPU, automatically
+     L3 cache    ~8 MB      ~10 ns      the CPU, automatically
+     RAM         ~GB        ~100 ns     the OS (the page model)
+     disk        ~TB        ~ms         the OS (filesystems)
+
+   (Numbers are indicative; what matters is the SHAPE: each level is
+    bigger and slower, and faster levels cache the slower ones.)
+\end{verbatim}
+
+A \emph{cache} is a small, fast store that keeps recently used data so
+the CPU rarely has to go to the slower level. When the CPU wants a
+word, it looks in the cache first; only a \emph{cache miss} sends it
+to RAM. Data moves between cache and RAM in fixed-size units called
+\emph{cache lines}---typically 64 bytes. This one fact explains more
+systems performance than any other:
+
+\begin{verbatim}
+   Why cache lines matter to your C code:
+
+     two adjacent ints:  cache line = [ 42 ][ 43 ]...  one fetch loads
+     both. A struct's fields arrive together (ch.3's AoS).
+
+     two ints 1000 bytes apart: two cache lines, two fetches. If an
+     algorithm walks field-by-field across many structs, it drags
+     whole cache lines it never uses.
+
+   Consequence: the COST of an operation depends on which cache lines
+   it touches, not just how many instructions it runs. This is why
+   Chapter 3's "array of structs vs struct of arrays" decision, and
+   Chapter 4's unrolled lists, are performance choices, not style.
+\end{verbatim}
+
+The hierarchy also explains the numbers this book quotes. ``A cache
+miss costs about 100 times a cache hit'' is the real reason aligned,
+sequential, localized data wins. And the page model of the OS sits one
+level down: RAM caches disk, exactly as L1 caches RAM. Same shape,
+different scale.
+
+\begin{insight}[Cache is invisible and irresistible]
+The CPU manages the caches with no help from your program. You cannot
+store into L1 ``by hand.'' But you \emph{can} arrange your data so
+that the automatic caching works for you---contiguous, aligned, walked
+in order. That arrangement is most of what ``performance engineering''
+means, and it runs through every later chapter.
+\end{insight}
+
+\section{Sizes of the Primitive Types}
+
+C's primitive types are contracts about the interpretation of a range of
+bytes. The type tells the compiler (a) how many bytes the object
+occupies, and (b) how to interpret those bytes. The standard defines
+\emph{minimum} sizes, but on our target machines---a modern 64--bit
+x86-64 or ARM64 system---the sizes are stable:
+
+\begin{verbatim}
+   type            size (bytes)   typical range
+   --------------  ------------   ------------------------------------
+   char            1              -128 .. 127           (signed)
+   unsigned char   1                0 .. 255
+   short           2             -32768 .. 32767
+   unsigned short  2                0 .. 65535
+   int             4              -2147483648 .. 2147483647
+   unsigned int    4                0 .. 4294967295
+   long            8              (on 64-bit Linux: 8 bytes)
+   unsigned long   8
+   float           4              ~7 decimal digits of precision
+   double          8              ~15 decimal digits of precision
+   pointer         8              (8 bytes, an address in the space)
+   --------------  ------------   ------------------------------------
+\end{verbatim}
+
+Do not trust your memory of this table on every platform: in C, you
+always ask the compiler for the true size at build time. That is the
+job of \code{sizeof}.
+
+\begin{lstlisting}[caption={Sizes as reported by the compiler itself.}]
+#include <stdio.h>
+
+int main(void) {
+    printf("char                = %zu bytes\n", sizeof(char));
+    printf("short               = %zu bytes\n", sizeof(short));
+    printf("int                 = %zu bytes\n", sizeof(int));
+    printf("long                = %zu bytes\n", sizeof(long));
+    printf("double              = %zu bytes\n", sizeof(double));
+    printf("int pointer         = %zu bytes\n", sizeof(int *));
+    printf("void pointer        = %zu bytes\n", sizeof(void *));
+    return 0;
+}
+\end{lstlisting}
+
+Notice the format specifier \code{\%zu}: the letter \code{z} says
+``the argument is a \code{size\_t}'', which is exactly the unsigned
+type \code{sizeof} yields. You will meet \code{size\_t} constantly;
+it is the type of every count in the standard library.
+
+\begin{ruleofthumb}[The Loop Counter Rule]
+In this course we use \code{size\_t} \emph{only} for loop counters that
+iterate over arrays and buffers. Everywhere else---indices computed from
+user input, signed arithmetic, difference between addresses---we use
+plain \code{int} or \code{long}. This keeps signs explicit and avoids
+the silent traps of unsigned wraparound when you subtract one index from
+another.
+\end{ruleofthumb}
+
+\section{The Address Space of a Process}
+
+When the operating system launches your program, it does not hand your
+process raw physical RAM. It constructs a \emph{virtual address space}:
+a private, contiguous-looking map of addresses in which your program
+lives. Each process gets the illusion of owning the whole machine. The
+map is laid out in a fixed order, from low addresses to high addresses:
+
+\begin{verbatim}
+   +--------------------------------------------------+  high addresses
+   |                                                  |  0x7fffffffffff
+   |                     STACK                        |
+   |  local variables, return addresses, arguments    |
+   |  grows DOWN toward lower addresses               |
+   |  |                                               |
+   |  v                                               |
+   +--------------------------------------------------+
+   |              (free region; this is where          |
+   |               memory mappings and shared libs    |
+   |               get placed)                        |
+   +--------------------------------------------------+
+   |  ^                                               |
+   |  |                                               |
+   |                     HEAP                         |
+   |  memory handed out by malloc()/calloc()/free()  |
+   |  grows UP toward higher addresses                |
+   +--------------------------------------------------+
+   |                     BSS                          |
+   |  uninitialized globals and statics (zeroed)     |
+   +--------------------------------------------------+
+   |                     DATA                         |
+   |  initialized globals, statics, string literals  |
+   +--------------------------------------------------+
+   |                     TEXT                         |
+   |  the machine code of your program                |
+   +--------------------------------------------------+  low addresses
+   |                     0x0  (unmapped, fault)       |
+   +--------------------------------------------------+
+\end{verbatim}
+
+This diagram is worth memorizing; we will return to it in every later
+chapter. Three regions dominate our mental model:
+
+\begin{description}
+  \item[TEXT] Read-only. The instructions themselves. If you try to write
+    here, the CPU raises a fault.
+  \item[DATA/BSS] Globals and statics. BSS is not stored in the binary;
+    the OS simply promises to give you zeroed memory at startup.
+  \item[STACK] Automatic (local) variables, function call frames, return
+    addresses. It grows \emph{down}.
+  \item[HEAP] Everything you allocate at runtime with \code{malloc}.
+    It grows \emph{up}.
+\end{description}
+
+The stack and the heap grow toward each other. This is why the phrase
+``stack overflow'' exists: a runaway recursive function walks the stack
+down until it collides with something it may not touch, and the
+operating system kills the process. Not a metaphor; a literal collision
+of addresses. (A \emph{recursive} function is simply one that calls
+itself; each call pushes another frame onto the stack, and one that
+never stops pushing is what ``overflows'' it. We write real recursive
+functions---tree traversal, directory walking---starting in
+Chapter~4.)
+
+\subsection{Virtual Memory and Pages}
+
+Two more words from the diagram need exact definitions now, because
+they will carry every chapter from here on.
+
+\emph{Virtual memory} is the mechanism behind the ``virtual address
+space'' just described. Your program's addresses---the \code{0x7ffc}
+numbers you printed in Chapter~1---are \emph{virtual}: they are not
+physical RAM addresses at all. The kernel keeps a translation table,
+the \emph{page table}, and the CPU consults it on every access,
+converting your virtual address into the physical address where the
+byte actually lives. This gives every process a private, huge address
+space, \emph{isolation} (your page table never contains another
+process's physical pages), and \emph{flexibility} (a virtual region can
+be backed by RAM, by a file, or by nothing yet).
+
+A \emph{page} is the unit of that machinery. Virtual memory is not
+managed byte by byte; it is chopped into fixed-size chunks---4~KB on
+our machines---and each chunk is mapped, protected, and shared as a
+whole.
+
+\begin{verbatim}
+   Virtual memory, drawn:
+
+   YOUR address space (virtual)        PHYSICAL RAM        the page table
+   +-----------------+                +-----------+        maps virtual
+   | stack (pages)   |                |           |        page -> physical
+   | heap  (pages)   |  ---page---->  |           |        frame
+   | data  (pages)   |  table lookup  |           |
+   | text  (pages)   |                |           |
+   +-----------------+                +-----------+
+
+   a virtual address: 0x7ffc1004
+        |
+        | split by the CPU into:  page number  0x7ffc   +  offset 0x004
+        |                         (look up in the page table)
+        v
+   physical address: the RAM cell that holds the byte
+
+   - A page that is "not present" in the page table is not in RAM;
+     touching it makes the CPU raise a PAGE FAULT, and the kernel
+     decides what that means (load the page, or kill the process).
+   - This is why the address space can look far larger than RAM: most
+     pages are simply not present, and RAM holds only what is in use.
+   - Each process has its OWN page table, which is what makes two
+     processes using the same virtual address able to hold different
+     data -- and what makes process A unable to read process B.
+\end{verbatim}
+
+The page explains several things you have already seen. A 4096-byte
+buffer in Chapter~5 is exactly one page. The stack that ``overflows''
+is a set of pages the kernel maps on demand and revokes on fault. And
+the mmap machinery of Chapter~12 and the allocators of Chapter~13 are
+both, at bottom, negotiations over pages.
+
+\begin{verbatim}
+   One page, drawn at scale (4 KB = 4096 bytes = 512 eight-byte words):
+
+     +--------------------------------+  address P (page-aligned)
+     |                                |
+     |         4096 bytes             |
+     |         (this page)            |
+     |                                |
+     +--------------------------------+  address P + 4095
+
+   Pages are PAGE-ALIGNED: a page's address is a multiple of 4096.
+   That is why malloc() returns 16-byte-aligned pointers but the heap
+   itself is built from page-sized regions.
+\end{verbatim}
+
+\begin{insight}[A page is the OS's atom]
+The OS never manages memory in bytes; it manages in pages. Everything
+that costs you performance---a page fault, a copy-on-write, a
+shared-memory mapping, a demand-paged file---happens page by page, at
+4~KB granularity, and nothing you do in user space is ever smaller
+than that at the OS level. When a program feels "slow on first
+access," the page is the culprit.
+\end{insight}
+
+\section{Addresses and Pointers}
+
+A \emph{pointer} is a variable whose value is an address. The type of a
+pointer records two things: the kind of data stored at the destination,
+and the fact that the value is an address. The type is a contract; the
+value is just an integer that happens to be a number of a memory cell.
+
+\begin{lstlisting}[caption={A pointer is a variable holding an address.}]
+#include <stdio.h>
+
+int main(void) {
+    int value = 42;
+    int *ptr;                 /* "ptr will hold the address of an int" */
+
+    ptr = &value;             /* &value: take the address of value */
+
+    printf("value  = %d\n", value);
+    printf("&value = %p\n", (void *) &value);
+    printf("ptr    = %p\n", (void *) ptr);
+    printf("*ptr   = %d\n", *ptr);
+
+    return 0;
+}
+\end{lstlisting}
+
+The \code{\&} operator, called \emph{address-of}, produces the address
+of the variable that follows it. The \code{*} operator, called
+\emph{dereference}, goes from the pointer to the object it points at.
+They are inverses: \code{*(\&value)} is \code{value}.
+
+Let us draw the state of memory at the moment just before the final
+\code{printf}:
+
+\begin{verbatim}
+   Suppose the compiler placed:
+     value at address 0x7ffc1004
+     ptr   at address 0x7ffc1008
+
+   We depict each memory cell as a box containing its value.
+   A pointer is drawn as an arrow to the cell it targets.
+
+              address       bytes               interpretation
+   value      0x7ffc1004    [ 42 ]              an int holding 42
+   ptr        0x7ffc1008    [ 0x7ffc1004 ]      an int* holding value's address
+
+   Box-and-arrow view:
+
+        +------------------+          +------------------+
+        |       ptr        |          |      value       |
+        |  0x7ffc1008      |--------->|      42          |
+        |  (holds address) |          |  (an int)        |
+        +------------------+          +------------------+
+
+   And in full:
+
+        +---------------------------------------------+
+        |  ptr = &value                               |
+        +---------------------------------------------+
+        |  "ptr"                |  "value"            |
+        |  addr 0x7ffc1008      |  addr 0x7ffc1004    |
+        |  value 0x7ffc1004 --->|  value 42           |
+        +---------------------------------------------+
+\end{verbatim}
+
+The arrow is the single most important diagram in this book. When you
+read C code, your job is to draw the arrows. When you write C code,
+your job is to know exactly which arrows exist and where they point.
+A C program is only correct if its arrows and its ownership rules are
+correct; everything else follows.
+
+\section{Dereferencing Is Reading or Writing Through an Arrow}
+
+Dereferencing is a two-way street. It can \emph{read} the cell the arrow
+points to, or it can \emph{write} through it. A dereference on the left
+side of an assignment writes to the pointed-to cell.
+
+\begin{lstlisting}[caption={Reading and writing through a pointer.}]
+#include <stdio.h>
+
+int main(void) {
+    int value = 42;
+    int *ptr = &value;
+
+    /* Read: fetch the int that ptr points at. */
+    printf("before: %d\n", *ptr);
+
+    /* Write: store a new int INTO the cell ptr points at. */
+    *ptr = 100;
+
+    printf("after:  value = %d, *ptr = %d\n", value, *ptr);
+
+    /* value was modified, because ptr points at value. */
+    return 0;
+}
+\end{lstlisting}
+
+\begin{verbatim}
+   Before:                      After *ptr = 100;
+
+     ptr ---> [ 42 ]              ptr ---> [ 100 ]
+                 value                       value
+\end{verbatim}
+
+There is nothing magic here. \code{*ptr = 100} means: ``go to the
+address stored in \code{ptr}, and write the bytes of \code{100} there.''
+The C compiler turns it into one store instruction. The pointer is just
+the messenger; the object it points at is what actually changes.
+
+\begin{insight}[Pointers are how C returns multiple values]
+Functions return one value. If you want a function to deliver two
+results, you pass pointers to the caller's variables and the function
+writes through them. This is exactly how \code{scanf} works, and how
+we will write our own data structure APIs in later chapters:
+\code{int list\_pop(struct list *l, int *out\_value);}
+\end{insight}
+
+\section{Pointer Arithmetic}
+
+A pointer plus an integer steps over whole \emph{elements}, not bytes.
+If \code{int *p} holds an address, then \code{p + 1} holds the address
+of the next \code{int} object, which is 4 bytes later on our machine.
+The compiler knows the size of the pointed-to type, so it does the
+multiplication for you.
+
+This is the C idiom that builds every array algorithm, and it is the
+place where ``clever'' code tends to hide. In this course we refuse
+obfuscation: we move pointers on explicit lines, we keep the current
+element in a named variable, and we only ever use \code{size\_t} as the
+loop counter. Compare the same loop written two ways.
+
+The style you will find in legacy code (and, alas, in many textbooks):
+
+\begin{lstlisting}[caption={Legacy style -- compact, but opaque.}]
+/* Copies the string src into the buffer dst. Obscured, hard to debug. */
+void copy_string(char *dst, const char *src) {
+    while (*dst++ = *src++);   /* we do NOT teach this */
+}
+\end{lstlisting}
+
+That line does four operations inside a test. If a bug appears, you
+cannot step through it one move at a time. The style we use:
+
+\begin{lstlisting}[caption={Our explicit style: one move per line, named pointers.}]
+#include <stddef.h>
+#include <string.h>
+
+/* Copy src into dst, including the terminating NUL byte. */
+/* Precondition: dst has room for strlen(src) + 1 bytes.     */
+void copy_string(char *dst, const char *src) {
+    size_t i;
+    size_t len;
+
+    len = strlen(src);
+
+    for (i = 0; i <= len; i++) {
+        /* Copy one byte: the element at position i of src. */
+        dst[i] = src[i];
+    }
+}
+\end{lstlisting}
+
+Notice what we gained: every step is a single, auditable statement.
+We can put a breakpoint on any line, print \code{i} and \code{len},
+and inspect the bytes one at a time. The clarity costs almost nothing
+in speed; a modern compiler turns the explicit loop into the same
+optimized code it would generate for the clever version. Clarity is
+nearly free. We take it.
+
+\section{Arrays Are Contiguous Bytes; Pointers Point at Elements}
+
+An array of \code{N} elements of type \code{T} is simply \code{N}
+objects of type \code{T} laid out consecutively in memory. There is no
+header, no length, no metadata. The address of the array is the address
+of its first element.
+
+\begin{verbatim}
+   int numbers[4] = {10, 20, 30, 40};
+
+   A 4-byte int is drawn as one box. The array occupies 16 consecutive
+   bytes:
+
+      numbers +----+----+----+----+
+              | 10 | 20 | 30 | 40 |
+              +----+----+----+----+
+      address: 1000 1004 1008 1012
+
+      numbers            == &numbers[0]   == 1000
+      numbers + 1        == &numbers[1]   == 1004
+      numbers + 2        == &numbers[2]   == 1008
+
+      *numbers           == 10
+      *(numbers + 2)     == 30            == numbers[2]
+\end{verbatim}
+
+The expression \code{numbers[i]} is defined to mean
+\code{*(numbers + i)}. The name of an array, used in an expression,
+\emph{decays} into a pointer to its first element. This is why
+passing an array to a function passes the address, not a copy: any
+write inside the function modifies the caller's array.
+
+\begin{lstlisting}[caption={Arrays decay to pointers when passed to functions.}]
+#include <stdio.h>
+
+/* Fill a buffer of n ints with the values 0..n-1. */
+void fill_seq(int *buf, size_t n) {
+    size_t i;
+
+    for (i = 0; i < n; i++) {
+        buf[i] = (int) i;
+    }
+}
+
+int main(void) {
+    int numbers[4] = {0, 0, 0, 0};
+    size_t i;
+
+    fill_seq(numbers, 4);           /* "numbers" is &numbers[0] here */
+
+    for (i = 0; i < 4; i++) {
+        printf("numbers[%zu] = %d\n", i, numbers[i]);
+    }
+
+    return 0;
+}
+\end{lstlisting}
+
+Note the parameter type \code{int *buf}. In the declaration of a
+function parameter, \code{int buf[]} and \code{int *buf} are identical.
+We write the pointer form, because it tells the truth about what is
+passed.
+
+\section{Stack vs.\ Heap: Who Owns the Memory?}
+
+This distinction is the pivot of all of C. Two places hold the data
+your program manipulates, and they differ in \emph{lifetime} and
+\emph{management}.
+
+\subsection{The Stack}
+
+Local variables live on the stack. When a function is called, the
+machine pushes a \emph{stack frame} containing its locals and return
+address; when the function returns, that frame is popped and its
+storage is, effectively, gone. Stack memory is:
+
+\begin{itemize}
+  \item allocated and freed automatically (by the call/return protocol),
+  \item extremely fast,
+  \item limited in size (typically ~8 MB on Linux),
+  \item invalid the moment the function returns.
+\end{itemize}
+
+\begin{lstlisting}[caption={A classic lifetime bug: returning a pointer to a stack local.}]
+#include <stdio.h>
+
+int *bad_function(void) {
+    int local = 42;
+
+    return &local;   /* ERROR: local dies when bad_function returns */
+}
+
+int main(void) {
+    int *p = bad_function();
+
+    /* p dangles: it names memory that the stack has already reclaimed. */
+    printf("%d\n", *p);   /* undefined behavior */
+    return 0;
+}
+\end{lstlisting}
+
+\begin{verbatim}
+   The stack during main() -> bad_function() -> return:
+
+      before call:     during bad_function():    after return:
+      +--------------+  +--------------+          +--------------+
+      | main frame   |  | main frame   |          | main frame   |
+      |  p = ?       |  |  p = ?       |   p ---> |  p = 0x...   |
+      +--------------+  +--------------+          +--------------+
+      (stack top)       | bad frame    |          (frame popped)
+                        |  local = 42  |<-- &local is now garbage
+                        +--------------+
+\end{verbatim}
+
+The address value survives; the storage behind it does not. We call
+\code{p} a \emph{dangling pointer}. No compiler can reliably catch
+every use of one; only discipline can. The rule:
+
+\begin{ruleofthumb}[Heap for anything that outlives its creator]
+If data must be returned from a function, or shared between functions,
+or sized by values known only at runtime, it goes on the \emph{heap},
+allocated with \code{malloc}, and freed with \code{free} by whichever
+party becomes its owner.
+\end{ruleofthumb}
+
+\subsection{The Heap}
+
+The heap is managed explicitly. \code{malloc(size)} asks the OS (via a
+bigger allocator such as \code{glibc}) for \code{size} bytes and
+returns a pointer to them, or \code{NULL} if it cannot. The bytes are
+\emph{yours} until you call \code{free}. Nothing is reclaimed
+automatically. This is the price of lifetime control, and it is a fair
+price: with it we build linked lists, hash tables, trees, and whole
+servers, all with deterministic behavior.
+
+\begin{lstlisting}[caption={A correct heap round-trip.}]
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+int main(void) {
+    char *buffer;
+    size_t len;
+
+    len = 32;
+    buffer = malloc(len);
+    if (buffer == NULL) {
+        fprintf(stderr, "out of memory\n");
+        exit(1);
+    }
+
+    strcpy(buffer, "hello from the heap");
+
+    printf("%s\n", buffer);
+
+    free(buffer);          /* hand the bytes back */
+
+    /* After free, buffer is a dangling pointer; do not dereference it. */
+    return 0;
+}
+\end{lstlisting}
+
+The \code{== NULL} check is not optional. \code{malloc} fails when the
+system cannot honor the request, and a good program treats that
+possibility as part of its normal control flow.
+
+\section{Pointers to Pointers}
+
+Sometimes the thing a pointer points at is, itself, a pointer. A
+\code{char **argv} is a pointer to an array of strings; a function that
+must \emph{reassign} a caller's pointer takes a pointer to that pointer.
+This is how we implement functions that ``return'' newly allocated
+objects through their arguments.
+
+\begin{lstlisting}[caption={Writing a new pointer into a caller's variable.}]
+#include <stdio.h>
+#include <stdlib.h>
+
+/* Allocates a small string and stores its address in *out. */
+void make_message(char **out) {
+    char *s = malloc(16);
+
+    if (s == NULL) {
+        *out = NULL;
+        return;
+    }
+    s[0] = 'O'; s[1] = 'K'; s[2] = '\0';
+
+    *out = s;          /* write the pointer into the caller's variable */
+}
+
+int main(void) {
+    char *msg = NULL;
+
+    make_message(&msg);      /* &msg is a char** */
+
+    if (msg != NULL) {
+        printf("%s\n", msg);
+        free(msg);
+    }
+
+    return 0;
+}
+\end{lstlisting}
+
+\begin{verbatim}
+   Before make_message(&msg):        After *out = s:
+
+     msg  [ NULL ]                     msg  [ 0x.. ] ---> [ O ][ K ][ 0 ]
+     out  [ &msg ]                     out  [ &msg ]
+\end{verbatim}
+
+The pattern is always the same: the parameter is a pointer to the
+variable we want the function to modify, and inside the function we
+dereference it to perform the write.
+
+\section{NULL: The Pointer That Points at Nothing}
+
+\code{NULL} is the address 0, and by convention it means ``this pointer
+is not currently valid''. It is the only address you may
+\emph{compare} against but never \emph{dereference}. The processor does
+not map address 0, so dereferencing a \code{NULL} pointer traps
+immediately with a segmentation fault, which is a favor: the bug
+surfaces exactly where it happens, instead of corrupting data silently
+a million instructions later.
+
+\begin{verbatim}
+   ptr ---> [ 42 ]       valid pointer, points at a real int
+
+   ptr = NULL;
+
+   ptr ---> 0x0          NOT a real object.
+   Dereferencing it:    *ptr  ==>  SIGSEGV (segmentation fault)
+\end{verbatim}
+
+Use \code{NULL} honestly: every allocation is checked against it,
+every function that may fail returns it, and every pointer in a
+structure that is ``not set'' holds it. \code{NULL} is the C equivalent
+of ``no object here'', and it costs nothing to check but a comparison.
+
+\section{Undefined Behavior: The Abyss}
+
+The C standard reserves the right to do \emph{anything} when your
+program crosses certain lines: dereferencing a dangling or \code{NULL}
+pointer, reading an uninitialized variable, overflowing a signed
+integer, indexing an array out of bounds. The compiler may assume you
+never do these things, and optimize accordingly. When you violate the
+contract, the program does not ``throw an exception''; it simply has no
+guaranteed behavior. It might work today and break tomorrow, or under a
+different compiler flag, or when the array happens to sit next to
+something important.
+
+This is why the discipline in this course is non-negotiable:
+
+\begin{itemize}
+  \item Every pointer is either valid, \code{NULL}, or untouched.
+  \item Every array index is checked against a length you carry.
+  \item Every \code{malloc} result is checked.
+  \item Every byte a function writes is justified by a size argument.
+\end{itemize}
+
+\section{Command-Line Arguments: argc and argv}
+
+Almost every real program is launched with arguments: \code{./tool
+input.txt -v}. Those arguments arrive in \code{main} through two
+parameters, and since every later chapter's practical programs use
+them, we define them once here.
+
+\begin{lstlisting}[caption={main receives its command line as argc and argv.}]
+#include <stdio.h>
+
+int main(int argc, char *argv[]) {
+    int i;
+
+    printf("program name: %s\n", argv[0]);
+    printf("number of arguments: %d\n", argc);
+
+    for (i = 1; i < argc; i++) {
+        printf("  argv[%d] = %s\n", i, argv[i]);
+    }
+
+    return 0;
+}
+\end{lstlisting}
+
+\begin{verbatim}
+   Running:   ./prog alpha "two words"
+
+   argc = 3           (the count of strings in argv)
+   argv[0] = "./prog"       the program's own name
+   argv[1] = "alpha"
+   argv[2] = "two words"    (quotes group a string with a space)
+
+   main's parameters:
+     argc   an int: how many strings are in argv (always >= 1)
+     argv   an array of char* strings; argv[argc] is always NULL
+
+   - The SHELL (or your parent process) builds this array and passes
+     it to the new program at exec time (ch.5). The kernel copies it
+     onto the new program's stack.
+   - argv[0] is not an argument the user typed; it is the name the
+     program was invoked as. Arguments the user typed begin at argv[1].
+   - That is why every practical in this book guards with
+     "if (argc < 2) { fprintf(stderr, \"usage...\"); }": it is
+     checking that the user actually supplied argv[1].
+\end{verbatim}
+
+The two spellings \code{char *argv[]} and \code{char **argv} are
+identical here, by the array-decay rule of Section~1.8. We write
+\code{char *argv[]} because it says what it is: an array of strings.
+And the strings themselves---the \code{argv[i]} values---are ordinary
+\code{char*} pointers into a region the kernel placed on the stack
+before \code{main} ran.
+
+\section{Practical Exercise: A Memory Inspector}
+Let us consolidate the chapter into a small, real tool. It prints the
+layout of a few variables and then hex-dumps a region of memory so you
+can literally \emph{see} bytes, addresses, and pointer values. Run it;
+look at the output until it stops being surprising.
+
+\begin{lstlisting}[caption={memory\_inspect.c: see bytes, addresses, and pointers.}]
+#include <stdio.h>
+#include <stdlib.h>
+
+/* Prints the raw bytes of the n bytes starting at p. */
+void hex_dump(const unsigned char *p, size_t n) {
+    size_t i;
+
+    for (i = 0; i < n; i++) {
+        /* Print byte number i, then a separator between groups of 8. */
+        printf("%02x", p[i]);
+        if ((i % 8) == 7) {
+            printf("  ");
+        } else {
+            printf(" ");
+        }
+    }
+    printf("\n");
+}
+
+int main(void) {
+    int value = 0x11223344;   /* one int, four bytes we can recognize */
+    int *ptr = &value;
+    char text[] = "abc";      /* four bytes: 'a','b','c','\0'         */
+
+    printf("=== addresses ===\n");
+    printf("&value     = %p\n", (void *) &value);
+    printf("&ptr       = %p\n", (void *) &ptr);
+    printf("&text      = %p\n", (void *) &text);
+    printf("ptr        = %p\n", (void *) ptr);
+
+    printf("\n=== sizes ===\n");
+    printf("sizeof(int)     = %zu\n", sizeof(int));
+    printf("sizeof(int *)   = %zu\n", sizeof(int *));
+    printf("sizeof(text)    = %zu\n", sizeof(text));
+
+    printf("\n=== the int as raw bytes ===\n");
+    hex_dump((unsigned char *) &value, sizeof(value));
+
+    printf("\n=== the pointer as raw bytes ===\n");
+    hex_dump((unsigned char *) &ptr, sizeof(ptr));
+
+    printf("\n=== the string (with its NUL terminator) ===\n");
+    hex_dump((unsigned char *) text, sizeof(text));
+
+    printf("\n=== stepping over an int with pointer arithmetic ===\n");
+    {
+        /* p moves from value to each byte-sized window inside it. */
+        unsigned char *q = (unsigned char *) &value;
+        size_t i;
+
+        for (i = 0; i < sizeof(value); i++) {
+            printf("byte %zu at %p = 0x%02x\n", i, (void *) &q[i], q[i]);
+        }
+    }
+
+    return 0;
+}
+\end{lstlisting}
+
+If your machine is little-endian (x86-64 and ARM64 both are), the int
+\code{0x11223344} is stored as the byte sequence \code{44 33 22 11}:
+the least significant byte comes first in memory. The pointer's raw
+bytes encode the address, and you will recognize them as the value
+\code{ptr} printed in the addresses section.
+
+\begin{insight}[Endianness]
+Endianness is the order in which the bytes of a multi-byte number are
+stored. Little-endian machines store the least significant byte first.
+Most of the time you will not care, but the moment you write a file
+format, a network protocol, or a virtual machine, you will care a great
+deal. We will revisit endianness when we serialize data to disk and to
+the network in later chapters.
+\end{insight}
+
+\begin{researchnote}[Memory allocators and custom allocators]
+All through this chapter we told you to trust \code{malloc} and check
+its result. Researchers have actually measured whether programs benefit
+from \emph{custom allocators}---hand-written replacements for
+\code{malloc} tuned for one program. ``Recent research'' here means a
+careful empirical study by Emery Berger and colleagues, and its
+conclusion is an excellent corrective to a very common habit: writing a
+custom allocator is usually wasted effort.
+
+\begin{verbatim}
+   The study:  Berger, Zorn, and McKinley studied eight applications that use
+   custom allocators and compared each one, in wall-clock time and in
+   memory, against the Lea allocator (the general-purpose malloc of the
+   day). Their finding, in one line:
+
+       "Custom allocators are rarely effective: for most programs a
+        general-purpose malloc performs as well as or better than the
+        custom allocator; only region-based allocators (arenas)
+        consistently show gains, of up to 44%."
+
+   (That is a brief paraphrase of the paper's findings, condensed for the book.)
+\end{verbatim}
+
+What makes the study trustworthy, and worth quoting: it is an
+\emph{empirical} result (measured, not argued), it was published in a
+peer-reviewed venue, and it runs against the folklore that every
+performance-sensitive program needs a hand-tuned allocator. The lesson
+for this book is simple: use \code{malloc}, use \code{free}, check
+failure, and profile \emph{before} you ever consider writing a custom
+allocator. We will revisit this when we design our own allocators in
+Chapter~13, where the goal will be \emph{policy} (object pools, arenas)
+rather than raw speed.
+
+\paperref{E.~D.~Berger, B.~G.~Zorn, K.~S.~McKinley, ``Reconsidering
+Custom Memory Allocation,'' ACM OOPSLA 2002}{https://people.cs.umass.edu/~emery/pubs/berger-oopsla2002.pdf}
+\end{researchnote}
+
+\section{Structures in Bytes}
+
+Every structure in this book---variable, struct, packet, inode---is,
+at bottom, a fixed arrangement of bytes. This section starts the habit
+of reading that arrangement; every later chapter ends with its own
+byte map. On our 64-bit little-endian machine, the scalars look like
+this:
+
+\begin{verbatim}
+   type         size   bytes (little-endian storage)
+   ---------    ----   ------------------------------------------------
+   char         1      01
+   short        2      01 00
+   int          4      01 00 00 00
+   long         8      01 00 00 00 00 00 00 00
+   float        4      00 00 80 3f            (the float value 1.0)
+   double       8      00 00 00 00 00 00 f0 3f   (the double value 1.0)
+   pointer      8      e6 3c a2 29 a0 00 00 00   (some address)
+\end{verbatim}
+
+Little-endian means byte 0 is the least significant byte, so the value
+\code{1} is stored as \code{01 00 00 00} and \code{0x11223344} as
+\code{44 33 22 11}. Reading a memory dump is reading these sequences in
+groups of the type's size. A stack frame is bytes too: on x86-64 the
+\code{call} instruction pushes an 8-byte return address, the callee
+saves the old frame pointer, then makes room for its locals:
+
+\begin{verbatim}
+   one stack frame (the stack grows downward):
+
+   +-------------------------------+
+   | caller's frame                |
+   +-------------------------------+
+   | return address          (8B)  |  pushed by the call instruction
+   +-------------------------------+
+   | saved frame pointer     (8B)  |  pushed by "push rbp"
+   +-------------------------------+  <- rbp
+   | locals (e.g. int value, 4B)   |
+   | and saved registers           |
+   +-------------------------------+  <- rsp
+\end{verbatim}
+
+\code{\&value} is a byte address inside that range---which is why the
+frame diagram of Chapter~1 and the byte diagram here are the same
+picture.
+
+\section{Summary of the Mental Model}
+
+At the end of this chapter you should be able to answer, for any
+snippet of C you read: \emph{which variable lives where, how many bytes
+it occupies, what pointer points at what, and who owns the memory.}
+
+\begin{verbatim}
+   The four questions of every C program:
+
+   1. Address : where do the bytes live?       (stack / heap / globals)
+   2. Size    : how many bytes?                (sizeof gives the truth)
+   3. Arrows  : which pointers point where?    (draw the diagram)
+   4. Owner   : who calls free()?              (exactly one party)
+\end{verbatim}
+
+If you can draw the memory diagram for a program, you understand the
+program. If you cannot, you do not---regardless of how many tests pass.
+This habit, more than any feature of the language, is what separates
+system programmers from everyone else.
+
+In the next chapter we open the machine's fastest memory: the
+\emph{registers}, built from flip-flops---bistable loops of
+transistors that hold a bit---and descend from the register image to
+the electronics and chemistry that make it retain its value. The
+chapter after that combines scalars into \emph{structures}, and
+learns why the machine, in its demand for aligned access, quietly
+inserts invisible bytes between our fields.

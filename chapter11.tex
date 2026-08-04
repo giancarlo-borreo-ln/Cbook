@@ -1,0 +1,720 @@
+% ============================================================================
+%  chapter11.tex
+%  Concurrency with Threads
+% ============================================================================
+
+\chapter{Concurrency with Threads}
+
+\section{A Process with Many Simultaneous Selves}
+
+Chapter~10 taught one process to serve many channels by never blocking.
+This chapter teaches the complementary approach: give one process
+\emph{many threads of execution}. A \emph{thread} is a single sequence
+of instructions running inside a process. A process with three threads
+is, from the CPU's point of view, three independent instruction
+streams---each with its own stack and registers---that happen to share
+one address space.
+
+\begin{verbatim}
+   Two views of the same program:
+
+   PROCESSES (ch.5-9):               THREADS (this chapter):
+
+   +----------+  +----------+       +-----------------------+
+   | stack    |  | stack    |       | stack T1  (private)   |
+   | heap     |  | heap     |       | stack T2  (private)   |
+   | data     |  | data     |       | stack T3  (private)   |
+   | text     |  | text     |       |   THE SHARED HEAP     |
+   +----------+  +----------+       |   THE SHARED GLOBALS  |
+        separate address             |   text                |
+        spaces, no shared             +-----------------------+
+        memory                         ONE address space,
+                                       many instruction streams
+
+   Threads share: the heap, the globals, the open descriptors.
+   Threads do NOT share: their stacks, their registers.
+
+   Sharing is the whole point -- and the whole danger.
+\end{verbatim}
+
+The trade-off with processes is now concrete. Processes are isolated
+but must use pipes or memory mapping to share anything; threads share
+everything trivially---a thread can read and write a global variable
+the way any function can---but that sharing is exactly where races
+come from. The rest of this chapter is the discipline that makes
+sharing safe.
+
+\begin{osconcept}
+Threads are the kernel (or the thread library) multiplexing several
+instruction streams onto one process. Because they share one address
+space, the \emph{context switch} between them is far cheaper than a
+process switch---no page tables to swap. But the kernel can schedule
+threads at any instruction boundary, so two threads can interleave
+their operations arbitrarily. That interleaving is the concurrency
+problem, and only disciplined coordination makes it safe.
+\end{osconcept}
+
+\section{pthread\_create and pthread\_join}
+
+The POSIX threads library (\code{pthreads}) is the C standard for
+threads. A thread is created with \code{pthread\_create}, which starts
+a function in a new thread, and \emph{reaped} with
+\code{pthread\_join}, which waits for that thread to finish and
+collects its result.
+
+\begin{lstlisting}[caption={Creating two threads and waiting for them.}]
+#include <stdio.h>
+#include <stdlib.h>
+#include <pthread.h>
+
+/* A thread runs one function to completion. */
+void *work(void *arg) {
+    int id;
+
+    id = *((int *) arg);
+    printf("worker %d on thread %lu\n", id, pthread_self());
+    return NULL;
+}
+
+int main(void) {
+    pthread_t t1;
+    pthread_t t2;
+    int id1;
+    int id2;
+    int r;
+
+    id1 = 1;
+    id2 = 2;
+
+    r = pthread_create(&t1, NULL, work, &id1);
+    if (r != 0) {
+        fprintf(stderr, "pthread_create: %d\n", r);
+        return 1;
+    }
+    r = pthread_create(&t2, NULL, work, &id2);
+    if (r != 0) {
+        fprintf(stderr, "pthread_create: %d\n", r);
+        return 1;
+    }
+
+    /* The main thread waits for both to finish. */
+    pthread_join(t1, NULL);
+    pthread_join(t2, NULL);
+
+    printf("both workers are done\n");
+    return 0;
+}
+\end{lstlisting}
+
+The signature is the first thing to master:
+
+\begin{verbatim}
+   pthread_create( &thread_id,     /* where to store the new thread  */
+                   NULL,           /* attributes: NULL = defaults    */
+                   work,           /* the function to run            */
+                   &id1 );         /* ONE pointer-sized argument     */
+
+   - The function is void *work(void *arg): it takes ONE void* and
+     returns ONE void*. That single pointer carries all input and
+     output. This is the same "one value in, one value out" contract
+     as thread arguments everywhere.
+
+   - pthread_create returns an ERROR NUMBER, not -1, and it does NOT
+     set errno. Check it against 0 and print the number itself.
+
+   - pthread_join(thread, &result) blocks until that thread returns;
+     the thread's return value is written through the second argument.
+
+   - The argument we pass must OUTLIVE the thread. We pass the
+     address of id1, a local of main that is still alive when the
+     thread runs. Passing the address of a loop variable that
+     changes would be a bug -- every thread would see the last value.
+\end{verbatim}
+
+\begin{verbatim}
+   The lifetime contract, drawn:
+
+     main
+       |
+       +-- pthread_create(&t1, work, &id1)  ->  thread t1 starts
+       |                                        running work(id1)
+       +-- pthread_create(&t2, work, &id2)  ->  thread t2 starts
+       |                                        running work(id2)
+       |
+       +-- pthread_join(t1)  <-- main blocks here until t1 returns
+       +-- pthread_join(t2)  <-- ...and here until t2 returns
+
+   A thread is like a process child, but inside the same memory.
+   create = fork, join = waitpid -- with sharing instead of copying.
+\end{verbatim}
+
+\begin{osconcept}
+Thread creation and reaping are, again, OS services: the kernel must
+allocate a new stack, new register set, and a new scheduler entry for
+the thread, then run it on whatever CPU is free. The shared address
+space is what makes threads cheap and also what makes them dangerous:
+the kernel gives threads \emph{no isolation}, so the safety that
+processes had by construction must now come from your discipline.
+\end{osconcept}
+
+\section{Data Races: The Shared-Variable Problem}
+
+Here is the problem that defines all of concurrency. Two threads read
+and write the same variable with no coordination. The C standard calls
+this a \emph{data race}, and a data race is \emph{undefined behavior}--
+the compiler may assume it never happens, and can optimize your
+program in ways that make the bug appear far away from its cause.
+
+\begin{lstlisting}[caption={The classic race: two threads, one counter.}]
+#include <stdio.h>
+#include <pthread.h>
+
+#define N 1000000L
+
+static long counter = 0;
+
+void *increment(void *arg) {
+    long i;
+
+    for (i = 0; i < N; i++) {
+        counter = counter + 1;
+    }
+    return NULL;
+}
+
+int main(void) {
+    pthread_t t1;
+    pthread_t t2;
+
+    pthread_create(&t1, NULL, increment, NULL);
+    pthread_create(&t2, NULL, increment, NULL);
+    pthread_join(t1, NULL);
+    pthread_join(t2, NULL);
+
+    printf("counter = %ld (expected %ld)\n", counter, 2 * N);
+    return 0;
+}
+\end{lstlisting}
+
+Every run prints a different number, almost never \code{2000000}.
+Why? Because \code{counter = counter + 1} is not one operation. It is
+three: read, add, write. The kernel can interrupt a thread between any
+two of them.
+
+\begin{verbatim}
+   The three steps of "counter = counter + 1", interleaved badly:
+
+   Thread 1                    Thread 2
+   -------                     -------
+   read counter  (0)
+   compute 0+1   (1)
+   write counter (1)
+                               read counter  (0)   <-- STALE: sees 0
+                               compute 0+1   (1)
+                               write counter (1)
+
+   Both read 0, both write 1. One increment was LOST.
+   With a million increments per thread, thousands are lost.
+
+   A DATA RACE: two threads access the same memory, at least one
+   write, with no synchronization in between. Result: undefined
+   behavior. The number can be anything.
+\end{verbatim}
+
+The fix is not ``make the threads less unlucky.'' The fix is to make
+the read-modify-write a single, indivisible unit---what we call a
+\emph{critical section}---protected by a lock. That is the next
+section.
+
+\begin{ruleofthumb}[Any shared, written memory needs a lock]
+The moment two threads can read a memory location that another thread
+writes, you have a data race, and you have undefined behavior. The
+only fix is synchronization: a mutex, a condition variable, or an
+atomic operation. "It probably works" is not a fix; a race is a time
+bomb with a random fuse.
+\end{ruleofthumb}
+
+\section{Mutexes: Making a Section Critical}
+
+A \emph{mutex} (from ``mutual exclusion'') is a lock. Before entering
+a critical section, a thread calls \code{pthread\_mutex\_lock}; while
+one thread holds the lock, any other thread trying to lock is
+\emph{blocked} by the kernel until the owner unlocks. The lock turns
+``read, add, write'' into a section that only one thread may be inside
+at a time.
+
+\begin{lstlisting}[caption={The race, fixed with a mutex.}]
+#include <stdio.h>
+#include <pthread.h>
+
+#define N 1000000L
+
+static long counter = 0;
+static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+
+void *increment(void *arg) {
+    long i;
+
+    for (i = 0; i < N; i++) {
+        pthread_mutex_lock(&lock);       /* enter critical section */
+        counter = counter + 1;           /* now safe: exclusive    */
+        pthread_mutex_unlock(&lock);     /* leave critical section */
+    }
+    return NULL;
+}
+
+int main(void) {
+    pthread_t t1;
+    pthread_t t2;
+
+    pthread_create(&t1, NULL, increment, NULL);
+    pthread_create(&t2, NULL, increment, NULL);
+    pthread_join(t1, NULL);
+    pthread_join(t2, NULL);
+
+    printf("counter = %ld (expected %ld)\n", counter, 2 * N);
+    return 0;
+}
+\end{lstlisting}
+
+\begin{verbatim}
+   The critical section, drawn:
+
+   Thread 1                          Thread 2
+   lock()   -> owns the mutex
+   counter++                         lock()   -> BLOCKS (kernel parks it)
+   unlock() -> releases
+                                     lock()   -> now owns it
+                                     counter++
+                                     unlock()
+
+   The lock makes the read-modify-write atomic WITH RESPECT TO OTHER
+   THREADS USING THE SAME LOCK. Two threads using DIFFERENT locks to
+   protect the SAME variable are still racing -- the lock only works
+   if everyone agrees on it.
+\end{verbatim}
+
+The discipline has four parts, and each is a rule:
+
+\begin{itemize}
+  \item \emph{One lock per unit of shared state.} The lock is a
+    contract: every access to \code{counter} goes through it, or the
+    contract is broken.
+  \item \emph{Lock and unlock always pair.} Every path that locks must
+    unlock---including error paths. (This is where C's lack of
+    ``finally'' makes discipline essential.)
+  \item \emph{Hold the lock as briefly as possible.} The critical
+    section should contain the minimum work, so threads wait the
+    minimum time.
+  \item \emph{Never block while holding a lock if you can avoid it.}
+    Holding a lock while waiting for I/O can stall every other thread
+    that wants the lock.
+\end{itemize}
+
+\begin{osconcept}
+A mutex is a synchronization primitive whose guarantee comes from the
+kernel. On Linux a \code{pthread\_mutex\_t} lives in user space, and
+the uncontended lock and unlock path never touches the kernel; only
+when a thread must actually wait does the kernel (through a futex) park
+it instead of letting it spin. Either way the OS guarantees that
+\emph{at most one} thread holds a given mutex, and that guarantee is
+what turns a sequence of instructions into a section others cannot
+enter.
+\end{osconcept}
+
+\section{Condition Variables: Waiting for a Condition}
+
+A mutex protects a variable; a \emph{condition variable} lets a thread
+\emph{wait for a state of the world}---``buffer is not empty,''
+``worker is done''---and be woken when that state arrives. The
+condition variable is always used \emph{together with} a mutex, and
+its central primitive does something that looks contradictory:
+
+\code{pthread\_cond\_wait(cond, mutex)} \emph{atomically releases the
+mutex and sleeps}. Another thread, seeing the state change, calls
+\code{pthread\_cond\_signal} to wake one waiter. The awakened thread
+re-acquires the mutex and re-checks the condition.
+
+The canonical example is the bounded buffer: a fixed-size ring of
+slots shared by producers and consumers.
+
+\begin{lstlisting}[caption={Producer/consumer with a mutex and condition variables.}]
+#include <stdio.h>
+#include <pthread.h>
+
+#define CAPACITY 8
+
+static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  not_full = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t  not_empty = PTHREAD_COND_INITIALIZER;
+
+static int buffer[CAPACITY];
+static int count = 0;
+
+/* Produce one value into the shared buffer. */
+void producer_put(int value) {
+    pthread_mutex_lock(&mutex);
+
+    /* Full? Then sleep until a consumer frees a slot.
+       The loop, not an if, is mandatory: cond_wait can wake
+       spuriously, and the state can change again before we
+       actually run. */
+    while (count == CAPACITY) {
+        pthread_cond_wait(&not_full, &mutex);
+    }
+
+    buffer[count] = value;
+    count = count + 1;
+
+    pthread_cond_signal(&not_empty);   /* wake one consumer */
+    pthread_mutex_unlock(&mutex);
+}
+
+/* Consume one value from the shared buffer. */
+int consumer_get(void) {
+    int value;
+
+    pthread_mutex_lock(&mutex);
+
+    /* Empty? Then sleep until a producer adds a value. */
+    while (count == 0) {
+        pthread_cond_wait(&not_empty, &mutex);
+    }
+
+    count = count - 1;
+    value = buffer[count];
+
+    pthread_cond_signal(&not_full);    /* wake one producer */
+    pthread_mutex_unlock(&mutex);
+
+    return value;
+}
+\end{lstlisting}
+
+\begin{verbatim}
+   The wait dance, step by step (producer side):
+
+     producer locks the mutex
+        |
+        |  buffer full?
+        |     yes --> cond_wait(not_full, mutex):
+        |              1. atomically UNLOCKS the mutex
+        |              2. sleeps until signaled
+        |              3. on wake, RE-LOCKS the mutex
+        |                     (then the while re-checks: full again?
+        |                      wait again -- this is the loop's job)
+        v
+     slot is free: write, signal, unlock.
+
+   The atomic unlock-and-sleep in cond_wait is the whole trick. If it
+   released the lock and THEN slept, a producer could slip in between
+   and the wait would race. The kernel makes the two a single step.
+\end{verbatim}
+
+\begin{ruleofthumb}[Always wait in a while loop, never an if]
+\code{pthread\_cond\_wait} may return \emph{spuriously} (the kernel
+does not guarantee one signal per wakeup), and by the time the waking
+thread runs, the condition may have changed again. The correct shape
+is always \code{while (condition) cond\_wait(...)}---re-check, don't
+assume. This one habit eliminates an entire class of concurrency bugs.
+\end{ruleofthumb}
+
+\begin{osconcept}
+A condition variable is the kernel's ``park me until the world
+changes'' primitive, and its atomic release-and-sleep is the 
+linchpin. Only the kernel can guarantee that the mutex is released
+and the thread put to sleep as one indivisible step, so that no
+signal is lost between the two. This is textbook operating-system
+synchronization---semaphores and monitors are the same idea under
+other names---and it is exactly why condition variables are kernel
+primitives rather than library conveniences.
+\end{osconcept}
+
+\section{Deadlock: The Lock You Will Never Get}
+
+When two threads each hold a lock the other needs, neither can
+proceed, and both wait forever. That is \emph{deadlock}. It is the
+second great concurrency bug, and it does not show up in tests---it
+shows up in production, at 3 a.m., when two requests hit the locks in
+the wrong order.
+
+\begin{verbatim}
+   Thread 1                      Thread 2
+   -------                       -------
+   lock(A)   ok                  lock(B)   ok
+   lock(B)   BLOCKS              lock(A)   BLOCKS
+             (B is held           (A is held
+              by T2)               by T1)
+   ...forever...                 ...forever...
+
+   The deadly embrace, drawn as a cycle:
+
+       T1 holds A, wants B
+       T2 holds B, wants A
+       --> a cycle of waiters. No one can make progress.
+
+   The cure is ORDER: give every lock a global rank, and acquire
+   locks in ascending order only. If everyone locks A before B,
+   the cycle above cannot form.
+\end{verbatim}
+
+The four necessary conditions for deadlock are worth memorizing,
+because removing \emph{any one} of them prevents it:
+
+\begin{verbatim}
+   deadlock needs all four:
+     1. mutual exclusion     -- the locks exist
+     2. hold and wait        -- a thread holds one lock, wants another
+     3. no preemption        -- you cannot steal a held lock
+     4. circular wait        -- the waiters form a cycle
+
+   We cannot remove 1 (locks must exclude). We control 2 and 4 by
+   design: acquire all locks in a fixed order (kills the cycle), and
+   hold nothing while waiting for I/O (kills hold-and-wait).
+\end{verbatim}
+
+\begin{lstlisting}[caption={The deadlock-free pattern: lock in one order, always.}]
+#include <pthread.h>
+
+void transfer(pthread_mutex_t *from_lock, pthread_mutex_t *to_lock,
+              long *from, long *to, long amount) {
+    /* Both threads lock in the SAME order (lowest address first).
+       Because the order is fixed, no cycle of waiters can form. */
+    if (from_lock < to_lock) {
+        pthread_mutex_lock(from_lock);
+        pthread_mutex_lock(to_lock);
+    } else {
+        pthread_mutex_lock(to_lock);
+        pthread_mutex_lock(from_lock);
+    }
+
+    *from = *from - amount;
+    *to = *to + amount;
+
+    pthread_mutex_unlock(to_lock);
+    pthread_mutex_unlock(from_lock);
+}
+\end{lstlisting}
+
+Comparing lock \emph{addresses} is a real, used technique: it imposes
+a total order on locks without naming them. Whatever the two threads
+pass in, they acquire them in the same sequence, and the circular wait
+becomes impossible.
+
+\begin{osconcept}
+Deadlock is the kernel being \emph{too} faithful: it parks a thread
+forever because that is exactly what the lock primitive promises. The
+OS cannot detect and fix your lock ordering for you---it only enforces
+mutual exclusion. Recognizing the four conditions and designing them
+away is a programming discipline, not a runtime feature, which is why
+deadlock prevention appears in operating-system textbooks and in
+every serious concurrency course.
+\end{osconcept}
+
+\section{Threads vs Processes: Which One}
+
+With both toolkits in hand, the choice is a design decision, not a
+religious one. The table is the decision procedure:
+
+\begin{verbatim}
+   concern            threads                      processes
+   ----------------   ---------------------------  -------------------
+   address space      ONE, shared                  private each
+   sharing data       variables (with locks)       pipes, shared memory
+   creation cost      cheap (a stack + TCB)        heavier (page tables)
+   crash isolation    NONE: one thread's segfault  strong: siblings
+                      kills the whole process      survive
+   communication      implicit, via memory         explicit, via kernel
+   best for           parallel compute, latency-   robustness, multi-
+                      critical I/O workers, GUI    tenant, "one bug
+                                                    must not spread"
+
+   The rule of thumb:
+     Need to move lots of data between two workers? THREADS.
+     Need one worker to be immune to another's crash? PROCESSES.
+     Need both? The classic pattern: a process per service, threads
+     inside each service.
+\end{verbatim}
+
+\section{Practical: A Parallel Sum}
+
+Let us put the chapter to work with a real parallel algorithm: sum a
+million numbers with four threads, each summing its own slice, then
+combine. The trick is that each thread writes only to its \emph{own}
+range struct---no shared counters, no locks needed, because the
+sharing is done once, up front, by careful partition.
+
+\begin{lstlisting}[caption={parsum.c: four threads, four disjoint slices.}]
+#include <stdio.h>
+#include <stdlib.h>
+#include <pthread.h>
+
+#define NTHREADS 4
+#define ELEMENTS 1000000
+
+static int data[ELEMENTS];
+
+typedef struct range {
+    int start;          /* first index, inclusive  */
+    int end;            /* last index, exclusive   */
+    long total;         /* this slice's sum        */
+} range;
+
+void *sum_range(void *arg) {
+    range *r;
+    long acc;
+    int i;
+
+    r = (range *) arg;
+    acc = 0;
+    for (i = r->start; i < r->end; i++) {
+        acc = acc + data[i];
+    }
+    r->total = acc;          /* only this thread touches r->total */
+    return NULL;
+}
+
+int main(void) {
+    pthread_t threads[NTHREADS];
+    range ranges[NTHREADS];
+    long grand;
+    size_t i;
+
+    /* Fill the array. */
+    for (i = 0; i < (size_t) ELEMENTS; i++) {
+        data[i] = 1;
+    }
+
+    /* Split the array into NTHREADS disjoint slices. */
+    for (i = 0; i < (size_t) NTHREADS; i++) {
+        ranges[i].start = (int) (i * ((size_t) ELEMENTS / NTHREADS));
+        ranges[i].end = (int) ((i + 1) * ((size_t) ELEMENTS / NTHREADS));
+        ranges[i].total = 0;
+        pthread_create(&threads[i], NULL, sum_range, &ranges[i]);
+    }
+
+    /* Collect: join each thread, add its slice. */
+    grand = 0;
+    for (i = 0; i < (size_t) NTHREADS; i++) {
+        pthread_join(threads[i], NULL);
+        grand = grand + ranges[i].total;
+    }
+
+    printf("sum = %ld (expected %d)\n", grand, ELEMENTS);
+    return 0;
+}
+\end{lstlisting}
+
+\begin{verbatim}
+   Why this program is race-free WITHOUT a single lock:
+
+     thread 0  owns data[0 .. 249999]   and ranges[0].total
+     thread 1  owns data[250000 .. 499999]  and ranges[1].total
+     ...
+     the main thread writes ranges[].start/.end BEFORE creating
+     the threads, and reads ranges[].total AFTER joining them.
+
+   Every memory location is written by exactly ONE thread at a time.
+   The only synchronization needed is the create/join itself, which
+   pthreads provides. Shared nothing until the combine--the design
+   discipline that makes concurrency easy.
+\end{verbatim}
+
+\begin{researchnote}[The origin of mutual exclusion]
+The mutex and condition variable you just used descend directly from
+work done in 1965 by Edsger Dijkstra, in a technical report called
+``Cooperating Sequential Processes.'' In it, Dijkstra posed the
+\emph{mutual exclusion problem}---two processes sharing variables
+must not interleave their critical sections---and introduced the
+\emph{semaphore}, the ancestor of the mutex, along with the very idea
+of a critical section.
+
+\begin{verbatim}
+   Dijkstra's formulation, condensed:
+
+       "If two processes share variables, each must protect its
+        critical section so that at most one is inside at any time;
+        the semaphore is the primitive that guarantees it."
+
+   Our pthread_mutex_lock/unlock and cond_wait are the modern,
+   clarified descendants of those first semaphores. When you write a
+   critical section, you are using a concept that is sixty years old
+   and still state of the art.
+\end{verbatim}
+
+It is a fascinating document---early concurrency worked out by hand,
+before anyone had seen it fail in production. Reading it is the
+fastest way to understand why the rules of this chapter exist.
+
+\paperref{E.~W.~Dijkstra, ``Cooperating Sequential Processes,''
+Technical Report EWD-123, Technological University Eindhoven,
+1965}{https://www.cs.utexas.edu/users/EWD/transcriptions/EWD01xx/EWD123.html}
+\end{researchnote}
+
+\section{Structures in Bytes}
+
+The pthread objects are user-space byte structures whose exact layout
+is an ABI detail you should treat as opaque---but their shapes are
+instructive. On glibc/x86-64:
+
+\begin{verbatim}
+   pthread_t       8 bytes    an opaque handle
+   pthread_mutex_t 40 bytes   owner + kind + count + wait list
+   pthread_cond_t  48 bytes   wait list + clock + sequencing
+
+   pthread_mutex_t (glibc x86-64), approximate offsets:
+   offset  size  field
+   0       4     lock
+   4       4     count        (recursion depth)
+   8       4     owner        (which thread holds it)
+   12      4     nusers
+   16      4     kind         (normal, recursive, errorcheck)
+   20      2     spins
+   24      8     wait list    (futex waiters)
+\end{verbatim}
+
+When the kernel switches threads, the byte structure it saves is the
+register image: 15 general-purpose registers at 8 bytes each (120
+bytes) plus the instruction and stack pointers, stored on the thread's
+kernel stack. That saved image, swapped on every context switch, is the
+mechanical meaning of ``two threads, two sets of registers, one
+address space.''
+
+\section{Summary}
+
+\begin{verbatim}
+   The concurrency toolbox, complete:
+
+   pthread_create / pthread_join   spawn and reap threads
+   shared address space            threads share heap and globals
+   data race                       unsynchronized shared writes = UB
+   pthread_mutex_t                 the critical section (mutual excl.)
+   pthread_cond_t                  wait for a condition, with the lock
+   deadlock                        lock cycles; fix by lock ordering
+
+   Rules that keep threaded code correct:
+     1. every shared, written variable is protected by a lock;
+     2. lock and unlock always pair, on every path;
+     3. hold locks briefly; never block for I/O while holding one;
+     4. cond_wait in a while loop, never an if;
+     5. acquire multiple locks in one global order;
+     6. prefer disjoint ownership (like the parallel sum) so locks
+        are rarely needed at all.
+\end{verbatim}
+
+\begin{osconcept}
+Threads are the OS's cheapest form of parallelism, purchased by
+surrendering the isolation that processes enjoyed. The kernel
+multiplexes instruction streams and enforces the primitives (locks,
+condvars) that make sharing safe; everything else---partitioning,
+ordering, and the discipline of the critical section---is the
+programmer's. Master that bargain and you can write programs that use
+every core; break it and you get bugs that reproduce only in
+production.
+\end{osconcept}
+
+The next chapter takes the sharing bargain to its logical extreme:
+shared memory, where processes---not threads---map the same bytes into
+their address spaces and synchronize over raw memory, with no kernel
+copying and no safety net.
+

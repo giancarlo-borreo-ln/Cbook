@@ -1,0 +1,895 @@
+% ============================================================================
+%  chapter17.tex
+%  Network Programming: Sockets and the Scalable Server
+% ============================================================================
+
+\chapter{Network Programming}
+
+\section{Beyond One Machine}
+
+Every channel in this book so far stayed inside one machine: pipes
+between processes on the same kernel, files on the same disk, signals
+to the same process tree. The network is the last boundary, and the
+most important one. It lets two processes on different machines---on
+different continents---exchange bytes, using a stack of protocols that
+the operating system provides and mostly manages for you.
+
+The astonishing fact that makes networking feel like the chapters
+before it is this: \emph{a network connection looks like a file
+descriptor}. You have already written the hard parts. After the setup,
+reading from a socket is \code{read}, writing is \code{write}, and the
+end of the conversation is the same EOF you met in Chapter~7. The new
+machinery is only the setup: naming the machine, naming the program,
+and agreeing on the rules of the conversation.
+
+\begin{verbatim}
+   The whole book, in one arrow:
+
+     our process  --read/write-->  a FILE DESCRIPTOR
+                                      |
+                        +-------------+-------------+
+                        |             |             |
+                      a file       a pipe       a SOCKET
+                      (ch.5)      (ch.7)    (this chapter)
+                                              |
+                                        another machine,
+                                        thousands of km away
+\end{verbatim}
+
+\begin{osconcept}
+The network is the operating system's biggest abstraction: the kernel
+owns the network hardware, implements the protocol stacks, and
+presents every connection as a descriptor your program reads and
+writes exactly like a file. Only the OS can do this, because only the
+OS can multiplex thousands of connections onto one network card and
+run the intricate protocol machinery that makes bytes survive the
+unreliable network between you and your peer.
+\end{osconcept}
+
+\section{The Three Names of a Network Conversation}
+
+To reach a program on another machine, your operating system needs
+three facts, and each is a different kind of name:
+
+\begin{description}
+  \item[The IP address] names the \emph{machine}. \code{192.168.1.10}
+    is a 32-bit number (IPv4) written as four bytes. It is the
+    network-layer name: ``that machine, out there.''
+  \item[The port] names the \emph{program} on that machine. A machine
+    runs many network programs at once; the port is how a connection
+    chooses one of them. \code{80} is the conventional web port,
+    \code{53} DNS, and your own servers use whatever you pick.
+  \item[The protocol] names the \emph{rules of conversation}. The two
+    that matter are TCP and UDP: TCP for reliable streams, UDP for
+    fast datagrams. Both travel on top of the same IP addressing.
+\end{description}
+
+\begin{verbatim}
+   A conversation needs all three:
+
+       192.168.1.10 : 9000     over  TCP
+        ^^^^^^^^^^^   ^^^^           ^^^
+        machine      program      the rules
+
+   The socket is exactly this triple. Create one, and you have asked
+   the OS for "a network endpoint on this machine, using this
+   protocol."
+\end{verbatim}
+
+\begin{osconcept}
+Ports are an OS-level namespace, exactly like the process tree and the
+filesystem hierarchy: the kernel keeps a table of ``which socket owns
+which port'' and enforces that only one program is bound to a port at
+a time. Without the kernel's arbitration, two programs could both
+claim port 9000 and incoming packets would have nowhere unambiguous to
+go. Naming and arbitration of ports is kernel work.
+\end{osconcept}
+
+\section{Sockets and Byte Order}
+
+A \emph{socket} is an endpoint for network communication---the thing
+your program holds as a descriptor. Creating one and giving it a name
+and a port is the setup dance, and it involves one concept you have
+not seen since Chapter~16: \emph{byte order}.
+
+The network's wire format is defined as \emph{big-endian}: the most
+significant byte first, regardless of what your CPU does. On a
+little-endian machine (our x86-64), that means integers written into
+socket addresses must be \emph{converted} before the kernel will read
+them correctly. The helpers are \code{htons} (host to network, short)
+and \code{htonl} (host to network, long). You met the problem in
+Chapter~16; the network is where it is unavoidable.
+
+\begin{lstlisting}[caption={Creating a socket address in network byte order.}]
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+
+#define PORT 9000
+
+int main(void) {
+    int fd;
+    struct sockaddr_in addr;
+
+    /* 1. Create the socket: IPv4 + TCP (SOCK_STREAM). */
+    fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        perror("socket");
+        return 1;
+    }
+
+    /* 2. Build the address: family, port, interface. */
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;                 /* IPv4 */
+    addr.sin_port = htons(PORT);               /* port in NETWORK order */
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);  /* any interface */
+
+    printf("socket created, fd = %d\n", fd);
+    printf("port in network byte order: %d\n", addr.sin_port);
+    close(fd);
+    return 0;
+}
+\end{lstlisting}
+
+\begin{verbatim}
+   The socket address struct, drawn:
+
+     struct sockaddr_in {
+         short   sin_family;     AF_INET (IPv4) or AF_INET6 (IPv6)
+         unsigned short sin_port;  the port, in BIG-ENDIAN byte order
+         struct in_addr sin_addr;  the IP address, big-endian too
+         ...                        (padding to the generic sockaddr)
+     };
+
+   - htons(9000) on a little-endian machine stores the bytes reversed,
+     so that the kernel (and the wire) sees 9000 correctly.
+   - htonl(INADDR_ANY) means "accept connections on ALL interfaces."
+   - inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr) converts a
+     dotted-quad string into the 32-bit address (the client's job).
+\end{verbatim}
+
+\begin{ruleofthumb}[The wire is big-endian; your struct is not]
+Whatever your CPU does, the network format is fixed: most significant
+byte first. Every integer that leaves your machine---ports, addresses,
+and any data you serialize---must be converted to network byte order,
+or the machine on the other end will read your numbers backwards. This
+is Chapter~16's wire-format discipline with a byte order the protocol,
+not you, chooses.
+\end{ruleofthumb}
+
+\section{A TCP Server, Step by Step}
+
+TCP is the \emph{connection-oriented} protocol: before any data, the
+two sides perform a handshake, and after the data, they close. The
+server's setup has four calls, and each has one job:
+
+\begin{verbatim}
+   The server lifecycle:
+
+     socket()   create the endpoint              (a descriptor)
+     bind()     give it a name: IP + port        ("I live here")
+     listen()   start accepting; the kernel       ("queue my calls")
+                queues incoming connections
+     accept()   take one connection off the       (returns a NEW
+                queue; returns a NEW socket        socket for THIS
+                for that one client                client)
+
+   accept() is the confusing step, and it is the heart of the model:
+   the LISTENING socket is not for talking -- it is for meeting.
+   Each accepted connection is a separate socket, with its own buffer
+   and its own conversation.
+\end{verbatim}
+
+\begin{lstlisting}[caption={tcp\_server.c: a complete one-client echo server.}]
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+
+#define PORT 9000
+
+int main(void) {
+    int listen_fd;
+    int conn_fd;
+    struct sockaddr_in addr;
+    char buf[1024];
+    ssize_t got;
+
+    listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_fd < 0) {
+        perror("socket");
+        return 1;
+    }
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(PORT);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+
+    if (bind(listen_fd, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
+        perror("bind");
+        return 1;
+    }
+
+    if (listen(listen_fd, 16) < 0) {        /* backlog: 16 queued */
+        perror("listen");
+        return 1;
+    }
+
+    printf("listening on port %d\n", PORT);
+
+    conn_fd = accept(listen_fd, NULL, NULL);  /* blocks until a client */
+    if (conn_fd < 0) {
+        perror("accept");
+        return 1;
+    }
+
+    printf("client connected\n");
+
+    /* Echo whatever the client sends until it closes. */
+    while (1) {
+        got = read(conn_fd, buf, sizeof(buf));
+        if (got <= 0) {
+            break;                  /* EOF: the client closed */
+        }
+        write(conn_fd, buf, (size_t) got);
+    }
+
+    close(conn_fd);
+    close(listen_fd);
+    return 0;
+}
+\end{lstlisting}
+
+The \emph{listen backlog} is the kernel's welcome mat: it tells the
+kernel how many pending connections it may queue while you are busy
+with others. If the queue is full, new connection attempts are simply
+delayed or refused---the kernel, not your program, holds the door.
+
+\begin{verbatim}
+   Why the backlog exists, drawn:
+
+        kernel's listen queue (capacity 16)
+        +------+------+------+...
+        | conn | conn | ...         <- the kernel holds these WHILE
+        +------+------+------+...      your program handles others
+        ^
+     clients connecting
+
+     your program:   accept()  takes ONE from the queue
+                     read/write over it
+                     accept()  takes the next...
+\end{verbatim}
+
+\begin{osconcept}
+The listening socket, the backlog queue, and the handshake are all
+kernel state. Your \code{listen} call only configures the kernel's
+welcoming; the kernel itself accepts the TCP handshake, queues the
+connection, and hands it to your \code{accept}. This is why a server
+can be slow to \code{accept} without dropping connections---the OS is
+holding the door. Only the kernel can do this, because only the kernel
+owns the protocol stack.
+\end{osconcept}
+
+\section{A TCP Client: The Three-Way Handshake}
+
+The client's setup is two calls: \code{socket} to create the endpoint,
+and \code{connect} to reach the server. The magic happens inside
+\code{connect}: it drives the TCP \emph{three-way handshake} with the
+kernel's help, so that when \code{connect} returns, both sides agree a
+connection exists and data can flow.
+
+\begin{lstlisting}[caption={tcp\_client.c: send a message, print the reply.}]
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+
+#define PORT 9000
+
+int main(int argc, char *argv[]) {
+    int fd;
+    struct sockaddr_in addr;
+    char buf[1024];
+    ssize_t got;
+
+    if (argc != 2) {
+        fprintf(stderr, "usage: %s message\n", argv[0]);
+        return 1;
+    }
+
+    fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        perror("socket");
+        return 1;
+    }
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(PORT);
+    if (inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr) <= 0) {
+        perror("inet_pton");
+        return 1;
+    }
+
+    /* connect performs the three-way handshake. */
+    if (connect(fd, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
+        perror("connect");
+        return 1;
+    }
+
+    write(fd, argv[1], strlen(argv[1]));
+
+    got = read(fd, buf, sizeof(buf));      /* blocks until the reply */
+    if (got > 0) {
+        printf("server echoed: %.*s\n", (int) got, buf);
+    }
+
+    close(fd);
+    return 0;
+}
+\end{lstlisting}
+
+\begin{verbatim}
+   The three-way handshake, drawn (the SYN packets):
+
+     server  (LISTEN)                 client
+        |                              socket()
+        |<---------- SYN ------------   connect(): "can we talk?"
+        |---------- SYN + ACK ------->  "yes, and my handshake"
+        |<---------- ACK -------------  "agreed"
+        |                              connect() returns: ESTABLISHED
+        |<--------- data -------------  now the read/write phase
+        |--------- data ------------->
+
+   Why THREE messages? Because each side must learn that the other is
+   there AND willing: the SYN asks, the SYN+ACK answers and asks back,
+   and the ACK closes the loop. A two-message version could not tell a
+   dead peer from a busy one.
+
+   Closing is a two-way FIN exchange: each side sends FIN when it is
+   done writing, and the other sees EOF (read returns 0). Half-closing
+   is legal: one side can finish sending while still reading.
+\end{verbatim}
+
+\subsection{How a Connection Works in Bytes}
+
+The handshake above is real packets, and packets are real bytes. Every
+TCP message---handshake or data---is an IP packet whose payload is a
+\emph{TCP segment}: a header followed by the user's data. The header
+is a wire format, exactly like the record format of Chapter~16, and it
+is what carries the connection's state. Here is the header, byte by
+byte:
+
+\begin{verbatim}
+   The TCP header (minimal form), drawn like a wire format:
+
+     bytes    field          meaning
+     ------   -------------  -----------------------------------------
+     0-1      src port       where THIS segment comes from
+     2-3      dst port       where it is going
+     4-7      sequence       the byte's position in the outgoing stream
+     8-11     ack number     the next byte expected from the peer
+     12       data offset    header length in 32-bit words (4 bits)
+     13       flags          (URG ACK PSH RST SYN FIN, among others)
+     14-15    window         flow control: how many bytes the receiver
+                             is willing to accept
+     16-17    checksum       integrity check over header and payload
+     18-19    urgent pointer (meaningful only when URG is set)
+     20+      payload        the user's data bytes (for data segments)
+
+   One segment is therefore: 20 bytes of protocol + the data.
+   The connection itself has NO bytes on the wire -- it IS the
+   sequence numbers and flags shared across segments.
+\end{verbatim}
+
+The two numbers that make the byte stream work are the
+\emph{sequence} and \emph{acknowledgment} fields. Every byte of data
+is numbered: the sender stamps each segment with the sequence number
+of its first byte, and the receiver acknowledges by sending back
+``I expect byte N next.'' This one mechanism does three jobs at once:
+ordering (the receiver sorts out-of-order segments by their numbers),
+retransmission (an unacknowledged byte is resent), and the byte
+stream your \code{read} sees.
+
+\begin{verbatim}
+   The three-way handshake in bytes:
+
+     client                            server
+        |  SYN, seq=1000                |
+        |------------------------------>|   "hello, start at byte 1000"
+        |  SYN+ACK, seq=7000, ack=1001  |
+        |<------------------------------|   "hello, I start at 7000;
+        |                               |    I expect your byte 1001"
+        |  ACK, seq=1001, ack=7001      |
+        |------------------------------>|   "agreed; I'm sending 1001"
+        |                               |
+        |  data "ada", seq=1001         |   <-- the payload bytes
+        |------------------------------>|       (sequence 1001 = first
+        |                               |        byte of "ada")
+        |  ACK, ack=1004                |
+        |<------------------------------|   "got bytes 1001..1003;
+        |                               |    next I expect 1004"
+
+   Read it as a wire format conversation: each arrow is a real
+   packet, each packet carries sequence numbers that let the kernel
+   on each side turn an arbitrary stream of segments into the ordered,
+   gap-free byte stream your read() returns.
+\end{verbatim}
+
+The lesson, tying the whole book together: a TCP connection is a
+\emph{protocol}, and a protocol is bytes with rules---the same idea as
+the MiniDB wire format of Chapter~16, scaled to two machines. The
+kernel implements the rules; your program sees only the resulting byte
+stream.
+
+\begin{osconcept}
+The byte-level machinery---sequence numbers, acknowledgments,
+retransmission, flow control---is the kernel's own wire-format
+implementation. Your program never sees segments or sequence numbers;
+the kernel consumes the wire protocol on your behalf and delivers a
+clean byte stream. This is the extreme of the book's theme: the OS
+turns raw, unreliable bytes on a wire into the abstractions your code
+was built to use.
+\end{osconcept}
+
+\begin{osconcept}
+The TCP handshake and connection state machine live entirely in the
+kernel. Your \code{connect} is one syscall; behind it the kernel
+retransmits lost SYN packets, times out dead peers, and tracks the
+connection's state (SYN-SENT, ESTABLISHED, FIN-WAIT, and so on)
+throughout. Reliability on an unreliable network is exactly the kind
+of tedious, time-sensitive machinery no application could duplicate--
+and exactly what an operating system is for.
+\end{osconcept}
+
+\section{Reading and Writing on a Socket}
+
+After the setup, a connected socket is a file descriptor, and every
+lesson of Chapters~4 and~6 applies unchanged:
+
+\begin{verbatim}
+   The socket is a byte stream, exactly like a pipe:
+
+     - read() may return FEWER bytes than requested: loop or accept
+       short reads.
+     - EOF (read returns 0) means the peer closed: its FIN arrived.
+     - write() may write fewer bytes than asked: loop.
+     - the data has NO message boundaries. "ab" then "cd" may arrive
+       as "abcd" or "abc"+"d". A protocol that needs messages must
+       frame them itself (length prefixes -- Chapter 16's wire format).
+     - blocking reads park the process until data arrives, exactly
+       like a pipe.
+
+   The ONE socket-specific rule: a socket is FULL-DUPLEX. Both sides
+   can read and write at the same time on the same socket -- unlike a
+   pipe, which flows one way.
+\end{verbatim}
+
+For a server that must hold many connections, blocking reads are the
+killer---the exact problem Chapter~10 solved with \code{poll}. The same
+medicine works on sockets, because a socket is a descriptor: set it
+\emph{non-blocking}, and reads that would block return \code{EAGAIN}
+instead. The event loop of Chapter~10 was already the right shape; it
+just needed a new source of descriptors.
+
+\section{TCP vs UDP}
+
+Not every conversation wants TCP's guarantees. The alternative,
+UDP, trades reliability for speed and simplicity: a UDP socket sends
+\emph{datagrams}---individual messages with boundaries, no connection,
+no handshake, and no promise that a message arrives, arrives once, or
+arrives in order.
+
+\begin{verbatim}
+   The two protocols, side by side:
+
+   concern        TCP                              UDP
+   ----------     -------------------------------  ---------------------------
+   connection     connected, handshake first       connectionless: just send
+   delivery       reliable, in order, no dupes     best effort: may lose,
+                                                  duplicate, or reorder
+   boundaries     byte STREAM: no message edges    DATAGRAM: one message,
+                                                  one recvfrom
+   overhead       higher (handshake, acks)         minimal
+   use for        HTTP, files, databases,          DNS, games, live media,
+                  anything needing correctness     broadcasts, fast probes
+   API            read() / write()                 recvfrom() / sendto()
+
+   The rule of thumb: if it must be correct, use TCP; if it must be
+   fast and small and can tolerate loss, use UDP. Many systems use
+   both -- TCP for control, UDP for media.
+\end{verbatim}
+
+A UDP server never accepts; it binds and then loops on
+\code{recvfrom}, which returns the datagram \emph{and} the address it
+came from, so the server can reply with \code{sendto}.
+
+\begin{lstlisting}[caption={udp\_echo.c: a datagram echo server.}]
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+
+#define PORT 9001
+
+int main(void) {
+    int fd;
+    struct sockaddr_in addr;
+    struct sockaddr_in peer;
+    socklen_t peer_len;
+    char buf[1024];
+    ssize_t got;
+
+    fd = socket(AF_INET, SOCK_DGRAM, 0);     /* UDP */
+    if (fd < 0) {
+        perror("socket");
+        return 1;
+    }
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(PORT);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+
+    if (bind(fd, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
+        perror("bind");
+        return 1;
+    }
+
+    printf("UDP echo on port %d\n", PORT);
+
+    while (1) {
+        peer_len = sizeof(peer);
+        got = recvfrom(fd, buf, sizeof(buf), 0,
+                       (struct sockaddr *) &peer, &peer_len);
+        if (got < 0) {
+            perror("recvfrom");
+            break;
+        }
+
+        /* Each datagram carried its own source: reply to IT. */
+        sendto(fd, buf, (size_t) got, 0,
+               (struct sockaddr *) &peer, peer_len);
+    }
+
+    close(fd);
+    return 0;
+}
+\end{lstlisting}
+
+\begin{verbatim}
+   recvfrom / sendto, and why they are different:
+
+     read/write  on a CONNECTED socket: the peer is known, no address
+     recvfrom    on an UNCONNECTED socket: each datagram brings its
+                 own return address (peer), used by sendto to reply
+
+   One UDP socket can talk to thousands of peers, because each
+   datagram is self-contained. That is UDP's superpower and its
+   curse: no connection means no one is keeping track of anyone.
+\end{verbatim}
+
+\begin{osconcept}
+The choice of TCP or UDP is a contract about how much the kernel will
+do for you. TCP asks the kernel to run a small protocol machine per
+connection---acknowledging, retransmitting, ordering, and closing---
+so your application can trust a byte stream. UDP asks the kernel for
+almost nothing, and your application inherits the network's
+unreliability. The OS provides both and the differences between them
+are entirely kernel policy.
+\end{osconcept}
+
+\section{The Scalable Server: One Loop, Many Sockets}
+
+The one-client echo server blocks on a single \code{accept}, then on a
+single \code{read}---it can serve exactly one client at a time. The
+fix is the chapter you already know: make every socket non-blocking,
+put them all in a \code{poll} array, and let one loop serve thousands.
+This is the event loop of Chapter~10, now watching sockets instead of
+pipes, with one new move: when the \emph{listener} reports readiness,
+we \code{accept} and add the new client to the set.
+
+\begin{lstlisting}[caption={echo\_server.c: a poll-driven, multi-client echo server.}]
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <errno.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+
+#define PORT 9000
+#define MAX_CLIENTS 64
+
+static int set_nonblocking(int fd) {
+    int flags;
+
+    flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) {
+        return -1;
+    }
+    return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+int main(void) {
+    int listen_fd;
+    struct sockaddr_in addr;
+    struct pollfd fds[MAX_CLIENTS];
+    int nfds;
+    char buf[1024];
+
+    listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_fd < 0) {
+        perror("socket");
+        return 1;
+    }
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(PORT);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+
+    if (bind(listen_fd, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
+        perror("bind");
+        return 1;
+    }
+    if (listen(listen_fd, 16) < 0) {
+        perror("listen");
+        return 1;
+    }
+    set_nonblocking(listen_fd);
+
+    printf("echo server on port %d\n", PORT);
+
+    /* fds[0] is the listener; clients are appended after it. */
+    fds[0].fd = listen_fd;
+    fds[0].events = POLLIN;
+    nfds = 1;
+
+    while (1) {
+        int r;
+        int i;
+
+        r = poll(fds, (nfds_t) nfds, -1);
+        if (r < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            perror("poll");
+            break;
+        }
+
+        for (i = 0; i < nfds; i++) {
+            if ((fds[i].revents & POLLIN) == 0) {
+                continue;
+            }
+
+            if (fds[i].fd == listen_fd) {
+                /* A NEW connection is ready to be accepted. */
+                int cfd;
+                int slot;
+
+                cfd = accept(listen_fd, NULL, NULL);
+                if (cfd < 0) {
+                    continue;
+                }
+                set_nonblocking(cfd);
+
+                slot = nfds;
+                if (slot >= MAX_CLIENTS) {
+                    close(cfd);        /* out of room: refuse politely */
+                    continue;
+                }
+                fds[slot].fd = cfd;
+                fds[slot].events = POLLIN;
+                nfds = nfds + 1;
+                printf("client %d connected\n", cfd);
+            } else {
+                /* A client has data, or closed. */
+                ssize_t got;
+
+                got = read(fds[i].fd, buf, sizeof(buf));
+                if (got <= 0) {
+                    /* EOF or error: close it, drop it from the set. */
+                    printf("client %d gone\n", fds[i].fd);
+                    close(fds[i].fd);
+                    fds[i] = fds[nfds - 1];   /* swap-last-into-slot */
+                    nfds = nfds - 1;
+                    i = i - 1;
+                } else {
+                    write(fds[i].fd, buf, (size_t) got);   /* echo */
+                }
+            }
+        }
+    }
+
+    return 0;
+}
+\end{lstlisting}
+
+\begin{verbatim}
+   The loop's two moves, drawn:
+
+        poll(fds, nfds)  -- one wait for EVERY socket
+              |
+              +-- listener ready?  accept(); append to fds[]
+              +-- client ready?    read(); echo
+              +-- client EOF?      close(); remove (swap-last)
+
+   - accept() is called only when the LISTENER is readable, so it
+     never blocks.
+   - reads happen only when a client is readable, and the sockets are
+     non-blocking anyway: no client can stall the world.
+   - removing a closed client by swapping the LAST slot into its place
+     keeps the array dense in O(1) -- the same trick as open-address
+     deletion with tombstones in Chapter 4.
+\end{verbatim}
+
+\section{Practical: Growing the Echo Server into a Database}
+
+The echo server is a skeleton; its muscle comes from everything
+earlier in the book. The same loop that echoes can \emph{parse} and
+\emph{store}, turning the server into a networked database with the
+command language of Chapter~14 and the durable storage of Chapter~16.
+
+\begin{verbatim}
+   The capstone architecture, all the pieces together:
+
+     client                       server (the poll loop of ch.10/17)
+     "SET name ada\n"                 |
+        |                             v
+        |  TCP ----------------->  read()  -- collect bytes into a
+        |                             line buffer (may need SEVERAL
+        |                             reads: TCP is a stream!)
+        |                             v
+        |                     lex() + parse()   (ch.14: the MiniDB
+        |                             |            front end)
+        |                             v
+        |                     db_set()           (ch.16: the dblog,
+        |                             |            durable on disk)
+        |                             v
+        |  <----------------------  write("ok\n")
+
+   Two new lessons the network adds on top of the earlier chapters:
+     1. A "line" may arrive split across reads, and several lines may
+        arrive in one read. The server must buffer until a full
+        record, using a length prefix (ch.16's wire format) to know
+        when it has one.
+     2. The event loop dispatches every connection's bytes to the
+        same parser -- one loop, one parser, many clients, and the
+        durable store behind it.
+\end{verbatim}
+
+Every capability in that picture was built in this book: descriptors
+(Chapter~5), the event loop (Chapter~10), the parser (Chapter~14), the
+durable log (Chapter~16). The network did not require a new idea; it
+required reusing the old ones across a socket.
+
+\begin{researchnote}[The philosophy of the internet protocols]
+The finale deserves the field's founding argument. In 1988, David
+Clark, one of the architects of the internet protocols, published
+``The Design Philosophy of the DARPA Internet Protocols.'' It is the
+clearest statement ever written of \emph{why} the network works the
+way it does---and it explains every design choice in this chapter.
+
+\begin{verbatim}
+   Clark's first principle, condensed:
+
+       "The internet is designed around a fundamental principle: the
+        network itself is deliberately simple and makes no guarantees;
+        the intelligence and reliability live at the ENDPOINTS, in
+        the hosts, not in the middle of the network."
+
+   In this chapter's terms: the network delivers packets best-effort,
+   and TCP--which lives in your kernel, at the endpoint--supplies the
+   reliability. The routers in the middle stay dumb and fast; the
+   cleverness is at the edges. This is the "end-to-end argument," and
+   it is why your socket's kernel does so much work.
+\end{verbatim}
+
+Clark's paper is short, opinionated, and remains the best one-page
+answer to ``why is the network built this way?'' Reading it closes the
+book's arc: from bytes and addresses on one machine, to a reliable
+byte stream between two machines, designed by the same principles of
+layering and explicit responsibility you have practiced all along.
+
+\paperref{D.~D.~Clark, ``The Design Philosophy of the DARPA Internet
+Protocols,'' ACM SIGCOMM 1988}{https://www.cs.princeton.edu/courses/archive/fall06/cos561/papers/clark88.pdf}
+\end{researchnote}
+
+\section{Structures in Bytes}
+
+The TCP header you just read is one of the three byte structures of a
+network conversation. The other two are the socket address you build
+with \code{htons}/\code{htonl}, and the IP header that carries every
+segment.
+
+\begin{verbatim}
+   struct sockaddr_in (IPv4): 16 bytes
+   offset  size  field
+   0       2     sin_family     (AF_INET = 2)
+   2       2     sin_port       (network byte order!)
+   4       4     sin_addr       (network byte order!)
+   8       8     padding to the generic sockaddr
+
+   the IPv4 header (no options): 20 bytes
+   offset  size  field
+   0       1     version + IHL      (4 + 4 bits; 5 words = 20 bytes)
+   1       1     DSCP / ECN
+   2       2     total length
+   4       2     identification
+   6       2     flags + fragment offset
+   8       1     TTL
+   9       1     protocol           (6 = TCP, 17 = UDP)
+   10      2     header checksum
+   12      4     source address
+   16      4     destination address
+
+   the UDP header: 8 bytes
+   offset  size  field
+   0       2     source port
+   2       2     destination port
+   4       2     length
+   6       2     checksum
+\end{verbatim}
+
+A datagram on the wire is IP header + transport header + payload
+(20 + 20 + data for TCP, 20 + 8 + data for UDP), every integer in
+network byte order. The kernel builds and parses these; your program
+only ever sets the two fields of the 16-byte \code{sockaddr\_in},
+converted with \code{htons} and \code{htonl}.
+
+\section{Summary}
+
+\begin{verbatim}
+   The networking toolbox, complete:
+
+   socket(AF_INET, SOCK_STREAM|SOCK_DGRAM, 0)   create an endpoint
+   sockaddr_in + htons/htonl/inet_pton          name it (byte order!)
+   bind()      give the socket its address and port
+   listen()    tell the kernel to queue connections
+   accept()    take one connection -> a NEW socket for that client
+   connect()   drive the three-way handshake (client side)
+   read/write  the connected socket is a byte stream (ch.5 rules)
+   recvfrom/sendto  UDP datagrams with per-message addresses
+   poll + non-blocking  one loop, many clients (ch.10, reused)
+
+   Rules that keep network code correct:
+     1. put every integer on the wire in network byte order;
+     2. a connected socket is a byte stream: buffer until you have a
+        full record, using a length prefix;
+     3. EOF (read == 0) means the peer closed; POLLHUP, too;
+     4. never block on one socket when serving many: non-blocking +
+        poll;
+     5. accept() only when the listener is ready; it never blocks
+        then.
+\end{verbatim}
+
+\begin{osconcept}
+Networking is the operating system's grand finale abstraction: the
+kernel owns the hardware, runs the protocols, holds the handshakes,
+and presents every conversation as a descriptor. The end-to-end
+principle says the network stays simple and the intelligence lives at
+the edges---in the kernels of the two hosts, and in the discipline of
+your program. You have now built, byte by byte, process by process,
+every layer between a variable in RAM and a message on the wire.
+\end{osconcept}
+
+This is where the book's tour ends and your systems programming begins.
+You hold all the tools: memory and pointers, structures and algorithms,
+processes, signals, pipes, threads, filesystems, durable storage, and
+the network. The machine is no longer a mystery; it is a set of
+contracts you understand, and the rest is experience.
+

@@ -1,0 +1,1063 @@
+% ============================================================================
+%  chapter16.tex
+%  Durable Storage: An Append-Only Log Database
+% ============================================================================
+
+\chapter{Durable Storage: An Append-Only Log Database}
+
+\section{Why Persistence Is Hard}
+
+\textbf{What persistence is.} A piece of data is \emph{persistent} when
+it survives longer than the program that created it---across a program
+restart, across a reboot, across a power loss. Data in RAM is
+\emph{volatile}: it lives exactly as long as the machine's power and
+the process's lifetime, and both can end at any instant. Data in a
+file is \emph{persistent}: it lives on storage, independent of any
+program and of the power state of the moment it was written. The whole
+discipline of this chapter is about moving data across that line---RAM
+to storage---without ever letting the transition lose the truth.
+
+\begin{verbatim}
+   Persistent vs volatile, the single idea:
+
+     volatile   dies when the power dies          (RAM, your heap)
+     persistent outlives the program and the      (files on disk)
+                power cycle
+
+   Your data is only as durable as its least persistent home:
+   a "saved" file still being held in the page cache is, until
+   fsync, one power loss away from vanishing (Section 16.3).
+\end{verbatim}
+
+Everything so far has stored data in \emph{RAM}, and RAM has a fatal
+flaw for a database: it forgets. Turn the machine off, and the heap,
+the hash tables, and the B-trees of earlier chapters are gone. A real
+store must be \emph{durable}: the data must survive a power loss and
+a crash, in a form that can be read back tomorrow.
+
+\begin{verbatim}
+   RAM vs storage, the two worlds:
+
+     RAM          fast, volatile: fine while the machine runs
+     file         slower, persistent: survives power loss
+
+   The database's job is to shuttle between the two worlds:
+   keep a fast copy in memory for answering queries NOW, and keep a
+   safe copy in a file for answering queries AFTER the next boot.
+
+   The hard part is the crash. A program can check every return
+   value and still vanish at any instant. The database must be
+   designed so that "vanished at any instant" leaves the file in a
+   state from which the truth can be recovered.
+\end{verbatim}
+
+This chapter builds a real, durable key-value store: an
+\emph{append-only log}. It is the smallest honest database---and the
+same idea, under the names write-ahead log (WAL) and journal, sits
+inside every production database you have ever used. When you finish
+you will understand how data survives crashes, why you cannot write a
+struct to a file and be done, and what ``durable'' actually means.
+
+\begin{osconcept}
+Durability is an operating system promise, and it is not free. When
+your program calls \code{write}, the bytes do not reach the disk; they
+reach the kernel's \emph{page cache}. Only \code{fsync} forces them
+out. The kernel exists between your program and the hardware, and it
+buffers for performance---so ``the file contains my data'' is a claim
+the OS, not your program, ultimately guarantees. A durable database is
+a careful conversation with the page cache.
+\end{osconcept}
+
+\section{The Append-Only Log}
+
+The simplest durable structure is also the best one. Instead of
+modifying a file in place, a database appends every change as a
+\emph{record} to the end of a log. The log is the source of truth; the
+in-memory structures are merely a cache of it. To rebuild after a
+crash, you \emph{replay} the log: read every record and re-apply it.
+
+\begin{verbatim}
+   The append-only log, drawn:
+
+   time --->  file "mydb.log"
+              +--------+--------+--------+--------+
+              | SET a=1 | SET b=2 | DEL a  | SET b=5|
+              +--------+--------+--------+--------+
+              records appended strictly in order, never overwritten
+
+   Startup replay: read every record, apply it in order.
+     SET a=1  ->  table[a] = 1
+     SET b=2  ->  table[b] = 2
+     DEL a    ->  remove a
+     SET b=5  ->  table[b] = 5
+
+   Result: { b = 5 }. The log reconstructs the exact final state.
+
+   Why appending is the right shape:
+     - appends are SEQUENTIAL writes, the fastest kind the disk does;
+     - an append never destroys existing data, so a crash can only
+       leave a PARTIAL RECORD at the tail -- never a corrupted middle;
+     - replay is deterministic: same log, same state, every time.
+\end{verbatim}
+
+The property to notice is what a crash can and cannot do. Because we
+only ever write at the tail, a crash mid-write can leave a torn record
+at the end---but it cannot corrupt records that were already
+completed. The database's recovery rule is therefore brutally simple:
+\emph{replay from the start, and stop at the first damaged record.}
+Everything before the damage is true.
+
+\begin{verbatim}
+   A crash at time X leaves:
+
+        +--------+--------+--------+------XXXXX
+        | SET a=1 | SET b=2 | SET a=1|  torn tail
+        +--------+--------+--------+------XXXXX
+                            ^ replay stops here: "a" and "b" are safe,
+                              the torn record is discarded
+
+   That is the entire crash story: replay the clean prefix, ignore the
+   torn tail. No recovery magic, no repair pass -- the design makes
+   recovery a read.
+\end{verbatim}
+
+\begin{osconcept}
+Append-only is crash-friendly because the kernel's behavior matches
+the structure: writes to a file are ordered, and once a write is
+acknowledged and flushed, those bytes are durable. By never modifying
+old bytes, the database ensures the past is always intact. Deciding
+``the log is truth, memory is cache'' is a systems-design decision that
+converts crash recovery from a ceremony into a read loop.
+\end{osconcept}
+
+\section{The Page Cache and fsync}
+
+Before the record format, the durability mechanic deserves its own
+section, because it decides what ``written'' means. When you call
+\code{write(fd, buf, n)}, the kernel copies your bytes into the
+\emph{page cache}---RAM that holds the file's pages---and returns. The
+disk has not necessarily seen them. The kernel flushes cached pages
+later, batched for efficiency. \code{fsync(fd)} is the syscall that
+says \emph{now}: do not return until the file's data has actually
+reached the storage device.
+
+\begin{verbatim}
+   Where a write() goes, layer by layer:
+
+     your buffer  --write()-->  kernel page cache  --fsync()-->  disk
+        ^                                ^
+        "acknowledged"               "really there"
+        (fast, not durable)          (slow, durable)
+
+   The three-layer model:
+     write()   copies bytes into the kernel's cache. Fast. Volatile:
+               a power loss may drop it.
+     fsync()   pushes the file's dirty pages to disk. Slow. Durable:
+               after it returns, the data survives a power loss.
+
+   Consequence for a database: a record is only durable AFTER fsync.
+   A database that writes and never fsyncs is a database that lies
+   to itself -- it has told the user "stored" while the truth still
+   sits in volatile RAM.
+\end{verbatim}
+
+\begin{ruleofthumb}[What durable means: fsync before you claim success]
+If you tell the user ``stored,'' the record must have been \code{fsync}'d.
+For a group of changes that must survive together, append them all,
+then \code{fsync} once. The ordering---write the record, then force it
+out---is the entire discipline of crash-consistent storage.
+\end{ruleofthumb}
+
+\begin{osconcept}
+The page cache is the kernel's buffer between your program and the
+hardware, and it is exactly the Chapter~5 ``buffer'' idea at system
+scale. The OS batches writes because disk I/O is millions of times
+slower than RAM. \code{fsync} is the escape hatch that buys
+durability when you need it. Deciding \emph{when} to pay that price is
+the difference between a toy that loses data and a database that does
+not.
+\end{osconcept}
+
+\section{The Record Format: Bytes, Not Structs}
+
+A record is a sequence of bytes on disk. Here is the first subtlety:
+you cannot simply \code{fwrite} a C struct. A struct contains
+\emph{padding} (Chapter~3) whose size differs between machines and
+compilers, its integers are stored in the machine's native
+\emph{endianness} (Chapter~1), and reading it back on another machine
+or with another compiler would misread every field. A durable format
+is a \emph{wire format}: a precise, byte-by-byte description written
+and read by hand.
+
+\begin{verbatim}
+   Our record, byte by byte:
+
+   +---------+------+--------+--------+-----+-------+----------+
+   | magic   | type | keylen | vallen | key | value | checksum |
+   | 4 bytes | 1 B  | 1 B    | 4 B    | ... | ...   | 4 bytes  |
+   +---------+------+--------+--------+-----+-------+----------+
+
+   magic     "!DB1" = 0x31424421, detects a wrong file or a torn
+            read at the record boundary
+   type      1 = SET (store key = value), 2 = DEL (remove key)
+   keylen    1 byte: key length 0..255
+   vallen    4 bytes: value length
+   key       keylen bytes
+   value     vallen bytes
+   checksum  a hash over everything before it, to detect corruption
+
+   The total record is 10 + keylen + vallen + 4 bytes. Every field's
+   position is fixed by the format, never by the struct layout.
+\end{verbatim}
+
+Two helpers define the wire format's integers. We choose
+\emph{little-endian}: byte 0 is the least significant. On an x86 or
+ARM machine that matches the hardware, and writing the bytes out
+explicitly makes the format portable by construction.
+
+\begin{lstlisting}[caption={Serialization helpers: ints as bytes, on purpose.}]
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
+
+#define MAGIC 0x31424421u    /* "!DB1" */
+
+#define REC_SET 1
+#define REC_DEL 2
+
+/* Write a 32-bit unsigned integer as 4 little-endian bytes. */
+static void put_u32(unsigned char *b, unsigned int v) {
+    b[0] = (unsigned char) (v & 0xff);
+    b[1] = (unsigned char) ((v >> 8) & 0xff);
+    b[2] = (unsigned char) ((v >> 16) & 0xff);
+    b[3] = (unsigned char) ((v >> 24) & 0xff);
+}
+
+/* Read a 32-bit unsigned integer from 4 little-endian bytes. */
+static unsigned int get_u32(const unsigned char *b) {
+    unsigned int v;
+
+    v = (unsigned int) b[0];
+    v |= ((unsigned int) b[1]) << 8;
+    v |= ((unsigned int) b[2]) << 16;
+    v |= ((unsigned int) b[3]) << 24;
+    return v;
+}
+
+/* FNV-1a: a fast, simple 32-bit hash. We seed it so a checksum can
+   be computed over several buffers as one rolling value.        */
+static unsigned int fnv1a_seed(unsigned int h,
+                               const unsigned char *p, size_t n) {
+    size_t i;
+
+    for (i = 0; i < n; i++) {
+        h = h ^ p[i];
+        h = h * 16777619u;
+    }
+    return h;
+}
+
+static unsigned int fnv1a(const unsigned char *p, size_t n) {
+    return fnv1a_seed(2166136261u, p, n);
+}
+\end{lstlisting}
+
+The checksum is the record's honesty check. We hash the header, the
+key, and the value; a torn write, a flipped bit, or a truncated tail
+changes the hash, and replay detects it. A checksum does not repair
+data---it makes \emph{corruption detectable}, which is what lets
+replay stop safely at the first bad record instead of trusting it.
+
+\begin{osconcept}
+A wire format is the boundary between two representations of the same
+data: in-memory structs (padding, native endianness, pointers) and
+durable bytes (no padding, fixed byte order, no pointers). Only the
+kernel delivers your bytes to the disk, but \emph{you} define what
+they mean. Getting this boundary explicit is the same discipline we
+will need for the network in Chapter~17---a network protocol is a wire
+format that travels over a socket instead of a file.
+\end{osconcept}
+
+\section{The Write Path: Append and fsync}
+
+The write path has two responsibilities: put a well-formed record at
+the end of the log, and make it durable before reporting success. The
+first needs a helper that writes \emph{all} requested bytes (a plain
+\code{write} may write fewer), and the second needs \code{fsync}.
+
+\begin{lstlisting}[caption={write\_all: loop until every byte is written.}]
+/* Write all n bytes, retrying on EINTR. Returns 0 or -1. */
+static int write_all(int fd, const void *buf, size_t n) {
+    const unsigned char *p;
+    size_t written;
+
+    p = buf;
+    written = 0;
+    while (written < n) {
+        ssize_t r;
+
+        r = write(fd, p + written, n - written);
+        if (r < 0) {
+            if (errno == EINTR) {
+                continue;        /* a signal interrupted us; retry */
+            }
+            return -1;
+        }
+        written = written + (size_t) r;
+    }
+    return 0;
+}
+\end{lstlisting}
+
+The append function builds the record into its on-disk form (header,
+key, value, checksum), writes the pieces in order, and fsyncs. The
+order of the bytes on disk is fixed by the format; the order of the
+fsync is fixed by the discipline: \emph{write first, claim success
+only after fsync}.
+
+\begin{lstlisting}[caption={append\_record: one durable record at the tail.}]
+typedef struct dblog dblog;   /* defined in the next section */
+
+/* Append one record. Returns 0 on success, -1 on failure. */
+static int append_record(dblog *db, int type,
+                         const char *key, int keylen,
+                         const char *value, int vallen) {
+    unsigned char header[10];
+    unsigned char check[4];
+    unsigned int sum;
+
+    put_u32(header, MAGIC);
+    header[4] = (unsigned char) type;
+    header[5] = (unsigned char) keylen;
+    put_u32(header + 6, (unsigned int) vallen);
+
+    /* Checksum over header + key + value, rolled into one hash. */
+    sum = fnv1a(header, 10);
+    sum = fnv1a_seed(sum, (const unsigned char *) key, (size_t) keylen);
+    sum = fnv1a_seed(sum, (const unsigned char *) value, (size_t) vallen);
+    put_u32(check, sum);
+
+    /* The four pieces of the record, in the wire order. */
+    if (write_all(db->fd, header, 10) < 0) {
+        return -1;
+    }
+    if (write_all(db->fd, key, (size_t) keylen) < 0) {
+        return -1;
+    }
+    if (write_all(db->fd, value, (size_t) vallen) < 0) {
+        return -1;
+    }
+    if (write_all(db->fd, check, 4) < 0) {
+        return -1;
+    }
+
+    /* Durable now: do not tell the caller "stored" until it is. */
+    if (fsync(db->fd) < 0) {
+        return -1;
+    }
+
+    db->offset = db->offset + 10 + keylen + vallen + 4;
+    return 0;
+}
+\end{lstlisting}
+
+\begin{verbatim}
+   The order is the contract:
+
+     1. append the record's bytes  (fast, into the page cache)
+     2. fsync()                    (slow, durable -- the record is
+                                    now safe against a power loss)
+     3. only then update memory    (the in-memory table is a cache;
+                                    the log is the truth)
+
+   If the process crashes between 1 and 2, replay may find a torn
+   tail and stop -- but it will never invent a record that was not
+   fully written. The fsync is the line between "maybe" and "stored."
+\end{verbatim}
+
+\section{The Read Path: Replay}
+
+Reading a log back is the mirror of appending, with one difference:
+appending assumes the file is well-formed, while replay must be
+\emph{suspicious}. A record may be torn, truncated, or corrupted, and
+replay must detect it and stop.
+
+The reader uses \code{pread}, a system call we have not needed before:
+\code{pread(fd, buf, n, offset)} reads at a given offset \emph{without
+moving the file position}. That is exactly right for replay---each
+record is read at a position we track ourselves, and the shared file
+position stays untouched.
+
+\begin{lstlisting}[caption={read\_record: read one record, or say why you cannot.}]
+/* Read one record at *pos. Returns:
+     1  -> a valid record (key/value returned, *pos advanced)
+     0  -> clean end of file
+    -1  -> torn or corrupted (replay must stop here)             */
+static int read_record(int fd, long *pos,
+                       int *type, char **key, int *keylen,
+                       char **value, int *vallen) {
+    unsigned char header[10];
+    unsigned char check[4];
+    unsigned char *key_buf;
+    unsigned char *value_buf;
+    unsigned int want;
+    unsigned int got;
+    int n;
+
+    n = (int) pread(fd, header, 10, *pos);
+    if (n == 0) {
+        return 0;                       /* clean end of file */
+    }
+    if (n != 10) {
+        return -1;                      /* torn header */
+    }
+    if (get_u32(header) != MAGIC) {
+        return -1;                      /* wrong file or bad boundary */
+    }
+
+    *type = header[4];
+    *keylen = (int) header[5];
+    *vallen = (int) get_u32(header + 6);
+
+    key_buf = malloc((size_t) *keylen + 1);
+    value_buf = malloc((size_t) *vallen);
+    if (key_buf == NULL || value_buf == NULL) {
+        free(key_buf);
+        free(value_buf);
+        return -1;
+    }
+
+    n = (int) pread(fd, key_buf, (size_t) *keylen, *pos + 10);
+    if (n != *keylen) {
+        free(key_buf);
+        free(value_buf);
+        return -1;
+    }
+    n = (int) pread(fd, value_buf, (size_t) *vallen,
+                    *pos + 10 + *keylen);
+    if (n != *vallen) {
+        free(key_buf);
+        free(value_buf);
+        return -1;
+    }
+
+    n = (int) pread(fd, check, 4, *pos + 10 + *keylen + *vallen);
+    if (n != 4) {
+        free(key_buf);
+        free(value_buf);
+        return -1;
+    }
+
+    want = fnv1a(header, 10);
+    want = fnv1a_seed(want, key_buf, (size_t) *keylen);
+    want = fnv1a_seed(want, value_buf, (size_t) *vallen);
+    got = get_u32(check);
+    if (want != got) {
+        free(key_buf);
+        free(value_buf);
+        return -1;                      /* checksum mismatch */
+    }
+
+    key_buf[*keylen] = '\0';
+    *key = (char *) key_buf;
+    *value = (char *) value_buf;
+    *pos = *pos + 10 + *keylen + *vallen + 4;
+    return 1;
+}
+\end{lstlisting}
+
+Replay is then a single loop: read a record, apply it, continue; stop
+at the first \code{0} (clean end) or \code{-1} (damage). The partially
+rebuilt table is the truth; the records after the damage, if any, are
+discarded.
+
+\begin{lstlisting}[caption={db\_replay: read the clean prefix, apply it.}]
+/* Rebuild the in-memory index by replaying the log from the start. */
+static void db_replay(dblog *db) {
+    long pos;
+    int r;
+
+    pos = 0;
+    while (1) {
+        int type;
+        int keylen;
+        int vallen;
+        char *key;
+        char *value;
+
+        r = read_record(db->fd, &pos, &type, &key, &keylen,
+                        &value, &vallen);
+        if (r <= 0) {
+            break;           /* clean end, or damage: stop here */
+        }
+
+        if (type == REC_SET) {
+            table_put(db, key, keylen, value, vallen);
+        } else if (type == REC_DEL) {
+            table_del(db, key, keylen);
+        }
+
+        free(key);
+        free(value);
+    }
+}
+\end{lstlisting}
+
+\begin{verbatim}
+   Replay is a loop over a file, and that is the whole point:
+   the recovery procedure is the same code as startup. There is no
+   "repair mode," no interactive recovery, no special case -- the
+   log was designed so that reading it IS recovering it.
+\end{verbatim}
+
+\section{The In-Memory Index and the API}
+
+The in-memory half is the hash table of Chapter~4, with one important
+role: it is a \emph{cache}, not the authority. Writes go to the log
+first and then to the table; reads come from the table. A lookup never
+touches the disk, which is why the database is fast; the log never
+lies, which is why it is durable.
+
+\begin{lstlisting}[caption={The database: a log plus a hash-table cache.}]
+typedef struct kv {
+    char *key;
+    int keylen;
+    char *value;
+    int vallen;
+    struct kv *next;
+} kv;
+
+typedef struct dblog {
+    int fd;
+    kv **buckets;      /* the hash table (Chapter 4) */
+    int nbuckets;
+    long count;        /* number of live entries      */
+    long offset;       /* current end of the log      */
+} dblog;
+
+static int hash_key(const char *key, int keylen, int nbuckets) {
+    return (int) (fnv1a((const unsigned char *) key,
+                        (size_t) keylen) % (unsigned int) nbuckets);
+}
+
+/* Look up a key in the table; returns the node or NULL. */
+static kv *table_get(const dblog *db, const char *key, int keylen) {
+    kv *cur;
+
+    cur = db->buckets[hash_key(key, keylen, db->nbuckets)];
+    while (cur != NULL) {
+        if (cur->keylen == keylen &&
+            memcmp(cur->key, key, (size_t) keylen) == 0) {
+            return cur;
+        }
+        cur = cur->next;
+    }
+    return NULL;
+}
+
+/* Insert or update. Returns 1 if a new key was added. */
+static int table_put(dblog *db, const char *key, int keylen,
+                     const char *value, int vallen) {
+    kv *node;
+    kv *cur;
+    int b;
+
+    cur = table_get(db, key, keylen);
+    if (cur != NULL) {
+        /* Update the existing node in place. */
+        char *new_value;
+
+        new_value = malloc((size_t) vallen);
+        if (new_value == NULL) {
+            return 0;
+        }
+        memcpy(new_value, value, (size_t) vallen);
+        free(cur->value);
+        cur->value = new_value;
+        cur->vallen = vallen;
+        return 0;
+    }
+
+    node = malloc(sizeof(kv));
+    if (node == NULL) {
+        return 0;
+    }
+    node->key = malloc((size_t) keylen);
+    node->value = malloc((size_t) vallen);
+    if (node->key == NULL || node->value == NULL) {
+        free(node->key);
+        free(node->value);
+        free(node);
+        return 0;
+    }
+    memcpy(node->key, key, (size_t) keylen);
+    memcpy(node->value, value, (size_t) vallen);
+    node->keylen = keylen;
+    node->vallen = vallen;
+
+    b = hash_key(key, keylen, db->nbuckets);
+    node->next = db->buckets[b];
+    db->buckets[b] = node;
+    db->count = db->count + 1;
+    return 1;
+}
+
+/* Remove a key if present. Returns 1 if it was removed. */
+static int table_del(dblog *db, const char *key, int keylen) {
+    kv **cur;
+    kv *victim;
+
+    cur = &db->buckets[hash_key(key, keylen, db->nbuckets)];
+    while (*cur != NULL) {
+        if ((*cur)->keylen == keylen &&
+            memcmp((*cur)->key, key, (size_t) keylen) == 0) {
+            victim = *cur;
+            *cur = victim->next;
+            free(victim->key);
+            free(victim->value);
+            free(victim);
+            db->count = db->count - 1;
+            return 1;
+        }
+        cur = &(*cur)->next;
+    }
+    return 0;
+}
+\end{lstlisting}
+
+The public API is three functions, each a short story about the log
+and the cache:
+
+\begin{lstlisting}[caption={The API: log first, then cache.}]
+/* Store key = value durably. */
+int db_set(dblog *db, const char *key, int keylen,
+           const char *value, int vallen) {
+    if (append_record(db, REC_SET, key, keylen, value, vallen) < 0) {
+        return -1;          /* the log did not take the record */
+    }
+    table_put(db, key, keylen, value, vallen);
+    return 0;
+}
+
+/* Remove key durably. Returns 1 if it existed, 0 if not. */
+int db_del(dblog *db, const char *key, int keylen) {
+    int existed;
+
+    existed = (table_get(db, key, keylen) != NULL);
+    if (existed) {
+        if (append_record(db, REC_DEL, key, keylen, NULL, 0) < 0) {
+            return -1;
+        }
+        table_del(db, key, keylen);
+    }
+    return existed;
+}
+
+/* Fetch a key. On success returns 1 and a malloc'd copy of the
+   value (the caller frees it); returns 0 if absent.             */
+int db_get(const dblog *db, const char *key, int keylen,
+           char **out_value, int *out_vallen) {
+    kv *node;
+    char *copy;
+
+    node = table_get(db, key, keylen);
+    if (node == NULL) {
+        return 0;
+    }
+    copy = malloc((size_t) node->vallen);
+    if (copy == NULL) {
+        return 0;
+    }
+    memcpy(copy, node->value, (size_t) node->vallen);
+    *out_value = copy;
+    *out_vallen = node->vallen;
+    return 1;
+}
+\end{lstlisting}
+
+Notice the ordering in \code{db\_set}: the record goes to the log
+\emph{first}, and the table is updated only if the append succeeded.
+If the append fails, memory must not pretend the write happened. If
+the append succeeds and we crash before touching the table, replay
+rebuilds it. \emph{Log first, cache second} is the rule, and it is
+what makes the two halves consistent.
+
+\begin{osconcept}
+The log/cache split is a layering decision of the same shape as
+Chapter~14's parser: an authority (the log) and a fast view (the
+table), with one-directional trust. The kernel provides the durability
+primitive (\code{fsync}); the database chooses when to pay for it; the
+cache makes reads cheap. Every production database---SQLite's journal,
+PostgreSQL's WAL---is this same split, tuned and enlarged.
+\end{osconcept}
+
+\section{Compaction: Shrinking the Log}
+
+An append-only log only grows. Every update of a key appends another
+record, so after a long life the log is full of dead records---old
+versions of keys that were later changed or deleted. The cure is
+\emph{compaction}: rewrite a fresh log containing only the \emph{live}
+entries, then swap it in atomically. The compaction walks the in-memory
+table (which already holds the truth) and writes one \code{SET} record
+per live entry.
+
+The swap uses \code{rename}, and that one call carries the whole
+atomicity: \code{rename} either succeeds completely or changes nothing,
+so at any instant a reader sees either the old log or the new one,
+never a mixture.
+
+\begin{lstlisting}[caption={db\_compact: live entries only, then an atomic swap.}]
+/* Rewrite the log with only the live entries. Returns 0 or -1. */
+int db_compact(dblog *db, const char *path) {
+    char tmp[1024];
+    int new_fd;
+    int b;
+    kv *cur;
+
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    new_fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (new_fd < 0) {
+        return -1;
+    }
+
+    /* Walk every bucket; write one SET record per live entry. */
+    for (b = 0; b < db->nbuckets; b++) {
+        cur = db->buckets[b];
+        while (cur != NULL) {
+            unsigned char header[10];
+            unsigned char check[4];
+            unsigned int sum;
+
+            put_u32(header, MAGIC);
+            header[4] = REC_SET;
+            header[5] = (unsigned char) cur->keylen;
+            put_u32(header + 6, (unsigned int) cur->vallen);
+
+            sum = fnv1a(header, 10);
+            sum = fnv1a_seed(sum, (const unsigned char *) cur->key,
+                             (size_t) cur->keylen);
+            sum = fnv1a_seed(sum, (const unsigned char *) cur->value,
+                             (size_t) cur->vallen);
+            put_u32(check, sum);
+
+            if (write_all(new_fd, header, 10) < 0) {
+                goto fail;
+            }
+            if (write_all(new_fd, cur->key,
+                          (size_t) cur->keylen) < 0) {
+                goto fail;
+            }
+            if (write_all(new_fd, cur->value,
+                          (size_t) cur->vallen) < 0) {
+                goto fail;
+            }
+            if (write_all(new_fd, check, 4) < 0) {
+                goto fail;
+            }
+
+            cur = cur->next;
+        }
+    }
+
+    /* Durable, then atomic: the rename is all-or-nothing. */
+    if (fsync(new_fd) < 0) {
+        goto fail;
+    }
+    close(new_fd);
+
+    if (rename(tmp, path) < 0) {
+        return -1;
+    }
+
+    close(db->fd);
+    db->fd = open(path, O_RDWR, 0644);
+    if (db->fd < 0) {
+        return -1;
+    }
+    db->offset = lseek(db->fd, 0, SEEK_END);
+    if (db->offset < 0) {
+        return -1;
+    }
+    return 0;
+
+fail:
+    close(new_fd);
+    unlink(tmp);
+    return -1;
+}
+\end{lstlisting}
+
+The \code{goto fail} deserves an explanation, because it is the one
+place this book uses \code{goto} on purpose. In C, error handling has
+no \code{finally} clause; the idiomatic pattern is a single cleanup
+label that every error path jumps to, so that cleanup code exists
+\emph{once} instead of being repeated after every failing call.
+Every \code{goto fail} means ``something went wrong; clean up the
+temporary file and return failure.''
+
+\begin{verbatim}
+   Compaction in pictures:
+
+     before:  log = SET a=1, SET b=2, SET a=1, SET a=3, DEL b
+              (5 records; only {a=3} is live)
+     compact: walk the table, write SET a=3 to "db.tmp", fsync
+     swap:    rename("db.tmp", "db")  -- atomic
+     after:   log = SET a=3  (one record; the dead history is gone)
+
+   A crash at any point leaves either the old (bigger) log or the new
+   (smaller) one. Both are valid; the rename is the boundary between
+   them, and it is atomic.
+\end{verbatim}
+
+\begin{osconcept}
+Atomic rename is a kernel guarantee that the database leans on: the
+filesystem makes the name switch indivisible, so compaction never
+exposes a half-written file. This is the same ``reference counting and
+naming is kernel business'' lesson as Chapter~8, applied to the most
+delicate moment in a database's life. The kernel's atomicity is the
+only reason swap-in-place works at all.
+\end{osconcept}
+
+\section{Practical: The Whole Database}
+
+Let us assemble every piece---serialization, append, replay, index,
+compaction---into one program, plus the two glue functions we have not
+shown (\code{db\_open} opens or creates the log and replays it;
+\code{db\_close} frees the index). The pieces have all appeared above;
+here is how they fit.
+
+\begin{lstlisting}[caption={dblog.c: opening, closing, and a demo main.}]
+int db_open(dblog *db, const char *path) {
+    int fd;
+
+    fd = open(path, O_RDWR | O_CREAT, 0644);
+    if (fd < 0) {
+        return -1;
+    }
+    db->fd = fd;
+    db->nbuckets = 1024;
+    db->count = 0;
+    db->offset = lseek(fd, 0, SEEK_END);
+    if (db->offset < 0) {
+        close(fd);
+        return -1;
+    }
+    db->buckets = calloc((size_t) db->nbuckets, sizeof(kv *));
+    if (db->buckets == NULL) {
+        close(fd);
+        return -1;
+    }
+
+    db_replay(db);        /* rebuild the cache from the log */
+    return 0;
+}
+
+void db_close(dblog *db) {
+    int b;
+    kv *cur;
+
+    for (b = 0; b < db->nbuckets; b++) {
+        cur = db->buckets[b];
+        while (cur != NULL) {
+            kv *next;
+
+            next = cur->next;
+            free(cur->key);
+            free(cur->value);
+            free(cur);
+            cur = next;
+        }
+    }
+    free(db->buckets);
+    close(db->fd);
+    db->buckets = NULL;
+    db->fd = -1;
+}
+
+int main(int argc, char *argv[]) {
+    dblog db;
+    char *value;
+    int vallen;
+
+    if (argc != 2) {
+        fprintf(stderr, "usage: %s dbfile\n", argv[0]);
+        return 1;
+    }
+
+    if (db_open(&db, argv[1]) < 0) {
+        perror("db_open");
+        return 1;
+    }
+
+    db_set(&db, "answer", 6, "42", 2);
+    db_set(&db, "name", 4, "ada", 3);
+    db_set(&db, "answer", 6, "43", 2);     /* update: appends a record */
+    db_del(&db, "old", 3);                 /* absent: no record written */
+
+    if (db_get(&db, "answer", 6, &value, &vallen) == 1) {
+        printf("answer = %.*s\n", vallen, value);
+        free(value);
+    }
+
+    db_compact(&db, argv[1]);
+    db_close(&db);
+    return 0;
+}
+\end{lstlisting}
+
+\begin{verbatim}
+   Run it, then look at the file -- the wire format is right there:
+
+     $ ./dblog /tmp/mydb.log
+     answer = 43
+     $ xxd /tmp/mydb.log
+     00000000: 21 44 42 31 01 06 02 00 00 00   !DB1.........
+                ^^ ^^ ^^ ^^ ^^    ^^^^^^^^
+                magic  type keylen vallen (2, little-endian)
+                "!DB1"  SET  = 6
+     0000000a: 61 6e 73 77 65 72               "answer"
+     00000010: 34 32                           "42"
+     00000012: XX XX XX XX                      checksum
+     ... and so on for each record.
+
+   Re-run the program: it opens the same file, REPLAYS it, and
+   prints answer = 43 again -- the data survived the previous run.
+   That is durability, demonstrated by reading the file back.
+\end{verbatim}
+
+\begin{verbatim}
+   To watch recovery from a torn tail, append garbage:
+
+     $ echo "garbage" >> /tmp/mydb.log
+     $ ./dblog /tmp/mydb.log        (the magic check fails; replay
+     answer = 43                     stops before the garbage, and
+                                     the clean prefix is intact)
+
+   No crash simulator needed: the checksum and magic find the damage,
+   replay stops, and the truth before the damage is preserved.
+\end{verbatim}
+
+\section{Where the Real Databases Go From Here}
+
+This log is a real, durable, replayable store in about three hundred
+lines. Production databases take the same skeleton and add four things,
+each of which we have met in earlier chapters:
+
+\begin{verbatim}
+   what real systems add            where we met the idea
+   ----------------------------     -------------------------------
+   batched, asynchronous fsync      the page cache (this chapter)
+   (group commit)                   and Chapter 5's buffering
+   sorted on-disk storage           the B-tree family (Chapter 4)
+   instead of replay-from-zero
+   concurrency and locking          threads (Chapter 11)
+   a network front end              the next chapter
+\end{verbatim}
+
+The lesson is that durability is not a library---it is a discipline
+of \emph{fsync ordering}, \emph{checksums}, and \emph{atomic
+renames}, exactly the ones you just wrote. Everything else is
+performance and convenience built on top.
+
+\begin{researchnote}[Log-structured storage, from the source]
+The decision to make a log the heart of a storage system has a famous
+pedigree. In 1991, Mendel Rosenblum and John Ousterhout published
+``The Design and Implementation of a Log-Structured File System,'' the
+paper behind the LFS filesystem---and, later, much of the modern
+flash-storage world. Its central idea is precisely this chapter's:
+\emph{treat the storage medium as one continuous log, write
+sequentially, and use a compacting cleaner to reclaim dead space}.
+
+\begin{verbatim}
+   The paper's thesis, condensed:
+
+       "By making all writes sequential appends to a log, the disk's
+        expensive seeks largely disappear, and a cleaner process that
+        rewrites only live data keeps the log from growing without
+        bound."
+
+   Translate to this chapter: append (sequential writes), checksum
+   (detect damage), compact (the cleaner). Your dblog is a
+   log-structured store in miniature, and the LFS paper is the
+   original argument for why that shape is fast and crash-safe.
+\end{verbatim}
+
+Reading it is worthwhile for one reason above all: it shows that the
+``simple'' log you just built was, in 1991, a research breakthrough,
+and that its ideas now sit inside everything from SSDs to databases.
+
+\paperref{M.~Rosenblum, J.~K.~Ousterhout, ``The Design and
+Implementation of a Log-Structured File System,'' ACM SOSP 1991}{https://web.stanford.edu/~ouster/cgi-bin/papers/lfs.pdf}
+\end{researchnote}
+
+\section{Structures in Bytes}
+
+The chapter's whole byte structure is the record format, so this is
+the page to keep. One record, with absolute offsets:
+
+\begin{verbatim}
+   offset  size  field           example (SET answer = "42")
+   0       4     magic "!DB1"    21 44 42 31
+   4       1     type            01 = SET
+   5       1     keylen          06
+   6       4     vallen          02 00 00 00   (little-endian 2)
+   10      keylen key            "answer"
+   10+keylen vallen  value       "42"
+   10+keylen+vallen  4  checksum  XX XX XX XX  (FNV-1a)
+
+   total length = 10 + keylen + vallen + 4.
+   the file is just records back to back:
+
+   [SET a=1][SET b=2][DEL a][SET b=5]    append-only, never rewritten
+\end{verbatim}
+
+Little-endian is a deliberate choice, written byte by byte by
+\code{put\_u32} and read back by \code{get\_u32}; the checksum covers
+header + key + value, so a torn tail fails the hash and replay stops
+at the last good byte. Compaction rewrites the same records into a
+temp file and \code{rename}s it over the original---the on-disk
+structure is unchanged, only shorter.
+
+\section{Summary}
+
+\begin{verbatim}
+   The durable-storage toolbox, complete:
+
+   the page cache      where write() actually puts your bytes
+   fsync()             the line between "maybe" and "stored"
+   append-only log     sequential writes; the past is never changed
+   wire format         bytes, not structs: fixed order, explicit
+                       endianness, no padding
+   checksum            makes corruption detectable
+   replay              reading the log IS recovering the database
+   pread()             read at an offset without moving the position
+   compaction          rewrite only live entries
+   rename()            the atomic swap between old log and new
+
+   Rules that keep durable code correct:
+     1. write the record, THEN fsync, THEN claim success;
+     2. append only at the tail; never overwrite old bytes;
+     3. serialize with a fixed wire format -- never fwrite a struct;
+     4. on any damage, replay stops: the clean prefix is the truth;
+     5. compact to a temp file, fsync, and rename atomically.
+\end{verbatim}
+
+\begin{osconcept}
+Durability is the operating system's oldest promise---\emph{your data
+will still be there tomorrow}---and this chapter was the conversation
+that keeps it: asking the kernel's page cache to flush, trusting its
+atomic renames, and using its files as the wire format's transport.
+The log is where the OS's storage services meet the data structures of
+the first half of this book, and it is the same architecture every
+real database runs.
+\end{osconcept}
+
+The database is durable on disk, and it has a command language. The
+final chapter gives it a voice across the machine: we build sockets,
+learn the TCP and UDP protocols, and turn this store---and the event
+loop of Chapter~10---into a server that answers the world.
+
+

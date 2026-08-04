@@ -1,0 +1,202 @@
+% ============================================================================
+%  main.tex
+% ----------------------------------------------------------------------------
+%  "C, Memory, and Systems" - A Definitive Course in C Programming,
+%  Data Structures, and Systems Architecture.
+%
+%  Pedagogically inspired by the C course of Salvatore Sanfilippo (antirez):
+%  start from the raw realities of memory, bytes and addresses; build real,
+%  production-shaped software; make every memory operation explicit.
+%
+%  Compile with:  ./build.sh        (runs pdflatex twice, opens zathura)
+% ============================================================================
+
+\documentclass[11pt,oneside]{book}
+
+% ---------------------------------------------------------------------------
+%  Packages
+% ---------------------------------------------------------------------------
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+
+\usepackage[margin=2.4cm, headheight=15pt, footskip=1.2cm]{geometry}
+
+\usepackage[table]{xcolor}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{microtype}
+\usepackage{setspace}
+
+\usepackage{fancyhdr}
+\usepackage{enumitem}
+\usepackage{titlesec}
+
+\usepackage{tikz}
+\usepackage{ifthen}
+\usepackage{listings}
+\usepackage{fancyvrb}
+
+\usepackage[many]{tcolorbox}
+\usepackage[hidelinks]{hyperref}
+
+% ---------------------------------------------------------------------------
+%  Colors (palette tuned for printed and screen reading)
+% ---------------------------------------------------------------------------
+\definecolor{cbk}{HTML}{3A3A3A}         % base text
+\definecolor{ccmt}{HTML}{6A9955}        % comments
+\definecolor{ckw}{HTML}{0000B0}         % keywords
+\definecolor{cstr}{HTML}{A31515}        % strings
+\definecolor{cnum}{HTML}{098658}        % numbers
+\definecolor{cbg}{HTML}{F7F7F5}         % code background
+\definecolor{cframe}{HTML}{C8C8C4}      % code frame
+\definecolor{cins}{HTML}{E8F0FE}        % insight box background
+\definecolor{cwar}{HTML}{FDF1E0}        % warning box background
+
+% ---------------------------------------------------------------------------
+%  Code listings: an explicit, readable C style.
+%
+%  We deliberately do NOT shade clever one-liners. Every snippet here uses
+%  explicit statements, named temporaries and separate lines for pointer
+%  moves, so the reader can trace memory exactly.
+% ---------------------------------------------------------------------------
+\lstdefinestyle{csrc}{%
+  language=C,
+  basicstyle=\ttfamily\small\color{cbk},
+  keywordstyle=\color{ckw}\bfseries,
+  commentstyle=\color{ccmt}\itshape,
+  stringstyle=\color{cstr},
+  numberstyle=\tiny\color{gray},
+  showstringspaces=false,
+  tabsize=4,
+  breaklines=true,
+  breakatwhitespace=true,
+  frame=single,
+  rulecolor=\color{cframe},
+  backgroundcolor=\color{cbg},
+  captionpos=b,
+  numbers=left,
+  numbersep=8pt,
+  xleftmargin=1.6em,
+  framexleftmargin=1.6em,
+  aboveskip=1.2em,
+  belowskip=1.2em,
+  morekeywords={size_t,ssize_t,uint8_t,uint16_t,uint32_t,uint64_t,int8_t,
+                int16_t,int32_t,int64_t,offsetof,NULL,malloc,calloc,realloc,
+                free,sizeof,struct,typedef,enum,union,const,volatile,restrict,
+                static,inline,printf,fprintf,sprintf,snprintf,scanf,fgets,
+                puts,exit,abort,assert,memcpy,memset,memmove,strlen,strcpy,
+                strncpy,strdup,strcmp,strncmp,strtol,errno,perror}
+}
+
+\lstset{style=csrc}
+
+% ---------------------------------------------------------------------------
+%  Verbatim: ASCII diagrams must never be split across a page boundary,
+%  or they render as "half broken" art that jumps to the next page.
+% ---------------------------------------------------------------------------
+\fvset{samepage=true}
+\RecustomVerbatimEnvironment{verbatim}{Verbatim}{}
+
+% ---------------------------------------------------------------------------
+%  Boxes for pedagogy: insights and rules of thumb.
+% ---------------------------------------------------------------------------
+\newtcolorbox{insight}[1][]{%
+  enhanced, breakable, colback=cins, colframe=blue!55!black, boxrule=0.6pt,
+  arc=2mm, left=3mm, right=3mm, top=2mm, bottom=2mm,
+  title={\textbf{\sffamily Insight}}\ifthenelse{\equal{#1}{}}{}{ --- \textbf{#1}},
+  fonttitle=\normalfont, attach boxed title to top left={yshift=-2mm, xshift=3mm},
+  colbacktitle=cins, coltitle=blue!55!black, boxed title style={empty}
+}
+
+\newtcolorbox{ruleofthumb}[1][]{%
+  enhanced, breakable, colback=cwar, colframe=orange!80!black, boxrule=0.6pt,
+  arc=2mm, left=3mm, right=3mm, top=2mm, bottom=2mm,
+  title={\textbf{\sffamily Rule of Thumb}}\ifthenelse{\equal{#1}{}}{}{ --- \textbf{#1}},
+  fonttitle=\normalfont, attach boxed title to top left={yshift=-2mm, xshift=3mm},
+  colbacktitle=cwar, coltitle=orange!80!black, boxed title style={empty}
+}
+
+\newtcolorbox{osconcept}{%
+  enhanced, breakable, colback=blue!5, colframe=blue!60!black, boxrule=0.6pt,
+  arc=2mm, left=3mm, right=3mm, top=2mm, bottom=2mm,
+  title={\textbf{\sffamily Why this is an OS problem}},
+  fonttitle=\normalfont, attach boxed title to top left={yshift=-2mm, xshift=3mm},
+  colbacktitle=blue!5, coltitle=blue!60!black, boxed title style={empty}
+}
+
+\definecolor{cpurp}{HTML}{5B2D8E}
+\newtcolorbox{researchnote}[1][]{%
+  enhanced, breakable, colback=purple!5, colframe=cpurp, boxrule=0.6pt,
+  arc=2mm, left=3mm, right=3mm, top=2mm, bottom=2mm,
+  title={\textbf{\sffamily Research Corner}}\ifthenelse{\equal{#1}{}}{}{ --- \textbf{#1}},
+  fonttitle=\normalfont, attach boxed title to top left={yshift=-2mm, xshift=3mm},
+  colbacktitle=purple!5, coltitle=cpurp, boxed title style={empty}
+}
+
+\newcommand{\paperref}[2]{%
+  \par\medskip\noindent{\small\textbf{Reference:}\ #1\ ---\ \url{#2}}\par
+}
+
+\newcommand{\code}[1]{\texttt{\small #1}}
+
+% ---------------------------------------------------------------------------
+%  Page style
+% ---------------------------------------------------------------------------
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small\textit{C, Memory, and Systems}}
+\fancyhead[R]{\small\textit{\nouppercase{\leftmark}}}
+\renewcommand{\headrulewidth}{0.4pt}
+\fancyfoot[C]{\small\thepage}
+
+\titleformat{\chapter}[display]
+  {\normalfont\huge\bfseries}{\chaptertitlename\ \thechapter}{18pt}{\Huge}
+\titlespacing*{\chapter}{0pt}{-20pt}{18pt}
+
+% ---------------------------------------------------------------------------
+%  Title page
+% ---------------------------------------------------------------------------
+\title{\vspace{-2.5cm}\Huge\textbf{C, Memory, and Systems}\\[0.8em]
+       \Large A Definitive Course in C Programming, Data Structures,\\
+       and Systems Architecture\\[1.2em]
+       \normalsize\emph{Beginning from bytes and addresses, building toward databases,}
+       \newline\normalsize\emph{network servers, and virtual machines.}}
+\author{The Open Book of the Machine}
+\date{}
+
+% ---------------------------------------------------------------------------
+%  Document
+% ---------------------------------------------------------------------------
+\begin{document}
+
+\frontmatter
+\maketitle
+\tableofcontents
+
+\mainmatter
+
+% Every chapter is guarded so the project compiles even while later
+% chapters are still being written. The full directive list for all
+% seventeen chapters lives here.
+\IfFileExists{chapter1.tex}{\include{chapter1}}{}
+\IfFileExists{chapter2.tex}{\include{chapter2}}{}
+\IfFileExists{chapter3.tex}{\include{chapter3}}{}
+\IfFileExists{chapter4.tex}{\include{chapter4}}{}
+\IfFileExists{chapter5.tex}{\include{chapter5}}{}
+\IfFileExists{chapter6.tex}{\include{chapter6}}{}
+\IfFileExists{chapter7.tex}{\include{chapter7}}{}
+\IfFileExists{chapter8.tex}{\include{chapter8}}{}
+\IfFileExists{chapter9.tex}{\include{chapter9}}{}
+\IfFileExists{chapter10.tex}{\include{chapter10}}{}
+\IfFileExists{chapter11.tex}{\include{chapter11}}{}
+\IfFileExists{chapter12.tex}{\include{chapter12}}{}
+\IfFileExists{chapter13.tex}{\include{chapter13}}{}
+\IfFileExists{chapter14.tex}{\include{chapter14}}{}
+\IfFileExists{chapter15.tex}{\include{chapter15}}{}
+\IfFileExists{chapter16.tex}{\include{chapter16}}{}
+\IfFileExists{chapter17.tex}{\include{chapter17}}{}
+
+\backmatter
+
+\end{document}

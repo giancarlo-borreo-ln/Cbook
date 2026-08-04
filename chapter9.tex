@@ -1,0 +1,662 @@
+% ============================================================================
+%  chapter9.tex
+%  Process Control: Groups, Sessions, and Daemons
+% ============================================================================
+
+\chapter{Process Control and Daemons}
+
+\section{From Single Processes to a Community}
+
+Chapter~5 created processes; Chapter~7 connected them with pipes;
+Chapter~6 taught them to react. This chapter asks the next question
+up: \emph{how does a collection of processes live together?} Real
+machines run hundreds of processes at once, and the operating system
+must group them so that it can signal them, schedule them, and police
+them as units. The two grouping concepts are the \emph{process group}
+and the \emph{session}, and they are the backbone of every shell,
+every terminal, and every daemon.
+
+\begin{verbatim}
+   The process tree. Every process has a parent; the root is init:
+
+     init (pid 1)
+       |
+       +-- systemd (pid 1's job: supervise everything)
+             |
+             +-- your login shell (a session leader)
+                   |
+                   +-- emacs      (foreground process group)
+                   +-- make       (a background group)
+                   |     +-- gcc
+                   |     +-- cc1
+                   +-- server     (another background group)
+
+   The tree is one fact; the groups and sessions are the labels the
+   kernel uses to decide who gets which signal and who may read the
+   terminal.
+\end{verbatim}
+
+\begin{osconcept}
+The kernel does not manage processes one by one; it manages them as
+units. Groups exist so that a signal or a job can address many
+processes at once, and sessions exist so that the kernel can tie one
+set of processes to one terminal. Deciding what those units are---and
+how a process joins or leaves them---is operating system bookkeeping,
+and it is what makes job control and daemons possible at all.
+\end{osconcept}
+
+\section{Process Groups}
+
+A \emph{process group} is a set of processes that share a group id. The
+group's purpose is to be a target: \emph{you can signal a whole group
+at once}. When you press Ctrl-C, the terminal does not signal your one
+process; it signals your entire foreground \emph{group}---which is why
+a pipeline like \code{cat f | sort} stops as one unit.
+
+\begin{lstlisting}[caption={Who am I, and who is my group?}]
+#include <stdio.h>
+#include <unistd.h>
+
+int main(void) {
+    printf("pid       = %d\n", getpid());
+    printf("process group = %d\n", getpgrp());
+    return 0;
+}
+\end{lstlisting}
+
+A child inherits its parent's process group; a session leader, or a job
+that a shell places in its own group, has a group id equal to its own
+pid---it starts a new group alone. The calls that move processes between groups are
+\code{setpgid} (join or create a group) and \code{getpgrp} (ask who
+your group is). The shell uses \code{setpgid} to gather a pipeline's
+children into one group so it can signal them together.
+
+\begin{lstlisting}[caption={Signal a whole group: note the minus sign.}]
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <signal.h>
+
+/* Ask every process in "pgrp" to terminate. */
+void kill_group(pid_t pgrp) {
+    int r;
+
+    r = kill(-pgrp, SIGTERM);    /* -pgrp means "the group named pgrp" */
+    if (r < 0) {
+        perror("kill group");
+    }
+}
+\end{lstlisting}
+
+\begin{verbatim}
+   kill(-pgrp, sig)  vs  kill(pid, sig):
+
+     kill(pid, sig)    signal ONE process
+     kill(-pgrp, sig)  signal EVERY process in the group pgrp
+     kill(0, sig)      signal every process in MY group
+     kill(-1, sig)     signal every process I may signal (extreme)
+
+   This is why Ctrl-C feels like it hits "the whole job": the terminal
+   driver runs kill(-foreground_pgrp, SIGINT). One call, many victims.
+\end{verbatim}
+
+\begin{osconcept}
+Process groups are the kernel's unit of \emph{collective action}. The
+OS lets one call address many processes because stopping or starting a
+job should be atomic with respect to the whole job, not piecemeal.
+The group id is kernel state; \code{setpgid} is a syscall that
+reassigns it, and only the kernel can guarantee that a group's members
+are tracked consistently.
+\end{osconcept}
+
+\section{Sessions and the Controlling Terminal}
+
+A \emph{session} is a collection of process groups, headed by a
+\emph{session leader} (the process that created the session). A
+session may own one \emph{controlling terminal}. The session is the
+unit that owns a terminal; within the session, exactly one process
+group---the \emph{foreground group}---is allowed to read it.
+
+\begin{verbatim}
+   One session, one terminal, three groups:
+
+      /dev/tty1  (the controlling terminal)
+         |
+         +---- session led by the login shell (sid = 100)
+                |
+                +---- FOREGROUND group  (your `cat bigfile`)
+                |       -- the ONLY group allowed to read the tty
+                |       -- receives Ctrl-C as SIGINT
+                |
+                +---- background group  (your `sleep 100 &`)
+                |       -- NOT allowed to read the tty
+                |       -- does NOT receive Ctrl-C
+                |
+                +---- background group  (your `make &`)
+
+   Two kernel-enforced rules that follow from this picture:
+
+     1. A background group that tries to READ the terminal is STOPPED
+        by SIGTTIN. Try it: run `cat` in the background of a shell
+        and it freezes, because the kernel refuses to let it steal
+        your keystrokes.
+
+     2. When you log out, the terminal closes; the kernel sends SIGHUP
+        (hang up) to the session's leader, which the shell uses to
+        clean up its jobs. Daemons, as we will see, detach from all
+        of this on purpose.
+\end{verbatim}
+
+\begin{lstlisting}[caption={Forking a background job is group arithmetic.}]
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+
+int main(void) {
+    pid_t pid;
+    pid_t my_group;
+
+    pid = fork();
+    if (pid < 0) {
+        perror("fork");
+        exit(1);
+    }
+
+    if (pid == 0) {
+        /* Child: put itself in its own new group, like a shell
+           backgrounding a job. Then run a command.                 */
+        setpgid(0, 0);            /* new group, id = my pid */
+        execlp("sleep", "sleep", "100", NULL);
+        perror("execlp");
+        exit(127);
+    }
+
+    /* Parent: also record the child in its new group, then wait. */
+    my_group = getpgrp();
+    setpgid(pid, pid);
+    printf("parent in group %d, child %d is in its own group %d\n",
+           (int) my_group, (int) pid, (int) pid);
+
+    waitpid(pid, NULL, 0);
+    return 0;
+}
+\end{lstlisting}
+
+\begin{verbatim}
+   Why both parent AND child call setpgid? A race:
+
+     - if the child runs first, IT calls setpgid(0,0) before the
+       parent's setpgid(pid,pid);
+     - if the parent runs first, the parent's call fixes the group
+       before the child execs.
+
+   Both orders are correct because setpgid is idempotent and allowed
+   for a process still in the same session. Shells do exactly this to
+   avoid a window where a backgrounded child could read the terminal.
+\end{verbatim}
+
+\begin{osconcept}
+Sessions and the controlling terminal are the kernel's answer to a
+very concrete problem: many processes share one screen, and the screen
+must have exactly one reader and one interrupt target at a time. The
+kernel owns the terminal device, so it can enforce the foreground rule
+mechanically---stopping an intruder with \code{SIGTTIN} and routing
+\code{SIGINT} only to the foreground group. This is why job control
+feels ``instant and fair'': it is hardware-level policy.
+\end{osconcept}
+
+\section{setsid: Leaving the Terminal Behind}
+
+\code{setsid} is the escape hatch. It creates a brand-new session,
+makes the caller its leader, and---crucially---\emph{detaches the
+caller from any controlling terminal}. After \code{setsid}, your
+process is a session leader with no terminal, no foreground group, and
+no route for Ctrl-C to reach it. This is the first step of becoming a
+daemon.
+
+\begin{lstlisting}[caption={setsid: new session, no terminal.}]
+#include <stdio.h>
+#include <unistd.h>
+
+int main(void) {
+    pid_t sid;
+
+    sid = setsid();
+    if (sid < 0) {
+        perror("setsid");
+        return 1;
+    }
+
+    printf("new session id = %d\n", (int) sid);
+    printf("(I am now a session leader with no controlling terminal)\n");
+    return 0;
+}
+\end{lstlisting}
+
+The catch: \code{setsid} fails if the caller is already a process
+group leader, because a group leader could accidentally make its whole
+group leave together. That failure is the entire reason for the
+\emph{first fork} in daemonization (next section).
+
+\begin{osconcept}
+\code{setsid} is the kernel's ``give me a clean room'' call. It
+allocates a new session, reassigns the process, and disconnects the
+terminal---all state only the kernel can change. The restriction that
+a group leader may not do it exists to keep the group atomic: the OS
+refuses to split a group mid-session, so your program must
+\emph{fork} to create a child that is not a leader. The detour is the
+kernel's safety rule, and daemons are built around it.
+\end{osconcept}
+
+\section{Daemons: Processes Without a User}
+
+A \emph{daemon} is a long-running background service: a web server, a
+database, a cron scheduler, an inotify watcher. It has no terminal, no
+interactive user, no expectation of ever being \code{Ctrl-C}'d from a
+shell. It is created to \emph{survive}: it must outlive the login
+session that started it, ignore the terminal's death, and keep running
+until told to stop.
+
+To become a daemon, a process must undo every link to the user world
+it inherited. The standard recipe, in order, is:
+
+\begin{verbatim}
+   The daemonization ceremony:
+
+   1. fork()          so the child is NOT a process group leader,
+                      and the parent may exit (the child becomes an
+                      orphan; init adopts it).
+
+   2. setsid()        the child becomes a new session leader with
+                      NO controlling terminal.
+
+   3. fork() AGAIN    now the child is not a session leader either,
+                      so it can never reacquire a controlling
+                      terminal. The first fork's child exits.
+
+   4. chdir("/")      leave whatever directory we were started in
+                      (that mount point may be unmounted later).
+
+   5. umask(022)      set a sane default for files the daemon creates.
+
+   6. close 0,1,2 and re-point all three at /dev/null, so any
+      accidental stdout write cannot spam a terminal that no longer
+      exists, and stdin reads return EOF instead of blocking.
+
+   The double fork is the part beginners get wrong. Explain it in one
+   line: the FIRST fork makes setsid() legal (child is not a group
+   leader); the SECOND fork makes the daemon unable to grab a
+   controlling terminal again (not a session leader).
+\end{verbatim}
+
+The double fork deserves a picture, because it is the most ritualistic
+step in all of Unix programming:
+
+\begin{verbatim}
+   Why fork twice?
+
+     process A (original)
+       |  fork()
+       v
+     process B   (not a group leader: setsid() is now ALLOWED)
+       |  setsid()  -> B becomes session leader
+       |  fork()
+       v
+     process C   (NOT a session leader: can never reacquire a tty)
+       |          this is the daemon; B exits immediately
+       v
+     the daemon lives on, adopted by init, immune to terminals.
+
+   A session leader that later opens a terminal device can be made
+   its controlling terminal again. A NON-leader cannot. The second
+   fork buys permanent detach.
+\end{verbatim}
+
+\begin{lstlisting}[caption={daemonize.c: the whole ceremony in one function.}]
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+
+/* Re-point descriptor fd at /dev/null. */
+static void point_at_devnull(int fd) {
+    int nfd;
+
+    nfd = open("/dev/null", O_RDWR);
+    if (nfd >= 0) {
+        dup2(nfd, fd);
+        close(nfd);
+    }
+}
+
+/* Become a daemon. Returns 0 on success, -1 on failure. */
+int daemonize(void) {
+    pid_t pid;
+
+    /* 1. First fork: the child may now call setsid(). */
+    pid = fork();
+    if (pid < 0) {
+        return -1;
+    }
+    if (pid > 0) {
+        exit(0);       /* parent's job is done */
+    }
+
+    /* 2. New session, no controlling terminal. */
+    if (setsid() < 0) {
+        return -1;
+    }
+
+    /* 3. Second fork: ensure we are not a session leader. */
+    pid = fork();
+    if (pid < 0) {
+        return -1;
+    }
+    if (pid > 0) {
+        exit(0);
+    }
+
+    /* 4. Work somewhere safe. */
+    if (chdir("/") < 0) {
+        return -1;
+    }
+
+    /* 5. Default permissions for files we create. */
+    umask(022);
+
+    /* 6. Detach all standard descriptors from any terminal. */
+    close(0);
+    close(1);
+    close(2);
+    point_at_devnull(0);
+    point_at_devnull(1);
+    point_at_devnull(2);
+
+    return 0;
+}
+\end{lstlisting}
+
+After \code{daemonize()} returns, the process has no terminal, no
+interactive parent that matters, and no user pressing Ctrl-C. That is
+both the point and the danger: nothing will stop it except a signal,
+so a well-behaved daemon installs signal handlers (Chapter~6) for
+\code{SIGTERM} and, very commonly, treats \code{SIGHUP} as
+``reload your configuration'' rather than ``die.''
+
+\begin{osconcept}
+Detaching from the user session is entirely an OS ceremony. Forking,
+creating sessions, unmounting-proof directories, and re-pointing
+descriptors are all kernel services; a user-space process cannot make
+itself terminal-independent any other way. (A \emph{mount point} is a
+directory where a filesystem is attached: the kernel hangs a disk's
+tree at that path. A daemon that keeps working inside a directory
+whose filesystem gets unmounted holds a broken view of the world,
+which is why the ceremony moves it to \code{/}.) The double-fork rule
+exists because the kernel defines who may own a controlling terminal
+(only session leaders), so the daemon must manipulate process/session
+state
+through syscalls to become permanently un-ownable.
+\end{osconcept}
+
+\section{Resource Limits}
+
+A daemon runs forever, so it must not grow forever. The kernel enforces
+per-process \emph{resource limits}---max open files, max memory, max
+CPU time---and your program can read and set them with
+\code{getrlimit}/\code{setrlimit}. Each limit has two values: the
+\emph{soft} limit (what the process normally gets) and the \emph{hard}
+limit (the ceiling the process may raise the soft limit to).
+
+\begin{lstlisting}[caption={Reading and raising the open-file limit.}]
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/resource.h>
+
+int main(void) {
+    struct rlimit rl;
+    int r;
+
+    r = getrlimit(RLIMIT_NOFILE, &rl);
+    if (r < 0) {
+        perror("getrlimit");
+        return 1;
+    }
+
+    printf("open-file limit: soft = %lu, hard = %lu\n",
+           (unsigned long) rl.rlim_cur,
+           (unsigned long) rl.rlim_max);
+
+    /* A server wanting more concurrent sockets raises the soft limit
+       toward the hard limit. */
+    if (rl.rlim_cur < rl.rlim_max) {
+        rl.rlim_cur = rl.rlim_max;
+        if (setrlimit(RLIMIT_NOFILE, &rl) < 0) {
+            perror("setrlimit");
+            return 1;
+        }
+        printf("raised soft limit to %lu\n", (unsigned long) rl.rlim_cur);
+    }
+
+    return 0;
+}
+\end{lstlisting}
+
+\begin{verbatim}
+   The limits you will actually need, in one table:
+
+     RLIMIT_NOFILE  how many descriptors you may hold open
+                    (a server with 10,000 connections needs a big one)
+     RLIMIT_AS      total address space a process may map
+     RLIMIT_CORE    size of core dumps (0 = disable them)
+     RLIMIT_CPU     seconds of CPU before the kernel kills you
+
+   `ulimit -n` in a shell is the same knob, set by the shell before
+   your program even starts. getrlimit() reads it from inside.
+\end{verbatim}
+
+\begin{osconcept}
+Resource limits are kernel-enforced policy: the kernel counts every
+descriptor and every byte of address space against the limit at the
+moment it is granted, and refuses to exceed it. A user-space program
+cannot ``borrow'' a bit more RAM when the kernel says no. Limits are
+the OS's way of containing runaway processes---which is exactly why
+daemons both read them and raise them, in full knowledge of what the
+kernel will and will not allow.
+\end{osconcept}
+
+\section{Practical: A Production-Shaped Daemon}
+
+Let us assemble the chapter---and the signal discipline of Chapter~6---
+into a complete daemon: double-forked, detached, signal-handled, with
+a \emph{pidfile} (a file holding its pid so \code{stop} scripts can
+find it). This is the skeleton that real services are built from.
+
+\begin{lstlisting}[caption={mydaemon.c: the full daemon life cycle.}]
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <signal.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+
+static volatile sig_atomic_t g_running = 1;
+
+static void handle_term(int sig) {
+    g_running = 0;             /* the only work the handler does */
+}
+
+/* Record our pid in a file so `kill $(cat pidfile)` finds us. */
+static void write_pidfile(const char *path) {
+    int fd;
+    char buf[64];
+    int n;
+
+    fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        return;                /* failure to write the pidfile is not
+                                  fatal for the daemon itself */
+    }
+    n = snprintf(buf, sizeof(buf), "%d\n", getpid());
+    write(fd, buf, (size_t) n);
+    close(fd);
+}
+
+int daemonize(void);           /* defined in Section 9.5 */
+
+int main(void) {
+    struct sigaction sa;
+
+    if (daemonize() < 0) {
+        perror("daemonize");
+        return 1;
+    }
+
+    /* Handle stop requests; SIGHUP would normally mean "reload". */
+    sa.sa_handler = handle_term;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGINT, &sa, NULL);
+
+    write_pidfile("/tmp/mydaemon.pid");
+
+    printf("daemon started, pid %d\n", getpid());
+
+    while (g_running) {
+        /* Real work would go here: accept, read, process, log.
+           printf() now goes to /dev/null, so logs must go to a
+           file or syslog instead. */
+        sleep(1);
+    }
+
+    unlink("/tmp/mydaemon.pid");
+    printf("daemon stopping\n");
+    return 0;
+}
+\end{lstlisting}
+
+\begin{verbatim}
+   Try the full cycle from a shell:
+
+     $ ./mydaemon
+     daemon started, pid 12345        (the prompt returns instantly:
+                                        the parent exited at fork 1)
+
+     $ ps -ef | grep mydaemon         (it is alive, no tty column)
+     $ cat /tmp/mydaemon.pid
+     12345
+     $ kill -TERM $(cat /tmp/mydaemon.pid)
+     $ ps -ef | grep mydaemon         (gone; pidfile unlinked)
+
+   Notice the pidfile made the whole lifecycle scriptable: anyone can
+   find the daemon by name, without knowing where it went.
+\end{verbatim}
+
+\begin{researchnote}[The evolution of process control]
+The session/daemon machinery of this chapter is old, and its design
+history is documented by the person who designed much of it. In 1979,
+Dennis Ritchie published ``The Evolution of the UNIX Time-sharing
+System,'' a retrospective on how the operating system grew: the fork
+model, signals, and the shell-based process control we take for
+granted were choices made and revised over a decade of use.
+
+\begin{verbatim}
+   Ritchie's retrospective, in one line:
+
+       "The first (shell) programs were simple, but the underlying
+        process-control mechanisms were general enough to support
+        everything that came later."
+
+   Read that as this chapter's thesis: fork, signals, and groups were
+   designed as GENERAL primitives, and the shell (and later job
+   control and daemons) built enormous behavior on top of a very small
+   set of ideas.
+\end{verbatim}
+
+It is a short paper and a charming read---part technical, part
+biography. It will make the fork/session machinery you just wrote feel
+less like arcane ritual and more like the deliberate engineering it is.
+
+\paperref{D.~M.~Ritchie, ``The Evolution of the UNIX Time-sharing
+System,'' Language Design and Programming Methodology, 1979}{https://www.bell-labs.com/usr/dmr/www/hist.pdf}
+\end{researchnote}
+
+\section{Structures in Bytes}
+
+Most process-control objects live in the kernel and have no stable
+byte layout, but two of them have shapes you will actually touch.
+
+\begin{verbatim}
+   struct rlimit on 64-bit Linux: 16 bytes
+   offset  size  field
+   0       8     rlim_cur     the soft limit
+   8       8     rlim_max     the hard limit
+
+   a pidfile is plain text:
+   "/tmp/mydaemon.pid"  ->  "12345\n"     (pid plus newline)
+\end{verbatim}
+
+The kernel's per-process record---its process control block---has a
+shape worth knowing even though the offsets change with every version:
+
+\begin{verbatim}
+   a minimal view of the per-process record:
+
+   offset  size  field
+   0       4     pid
+   4       4     ppid
+   8       4     pgid       (the process group)
+   12      4     sid        (the session)
+   16      1     state      (running, stopped, zombie...)
+   ...     8     pointer to the open-file table
+   ...     8     pointer to the signal dispositions (Chapter 6)
+\end{verbatim}
+
+What is stable is the content, not the offsets: a process is a byte
+record carrying its ids, its state, and pointers to its tables---the
+same facts \code{getpid()}, \code{getpgrp()}, and \code{setsid()}
+read and write.
+
+\section{Summary}
+
+\begin{verbatim}
+   The process-control model, complete:
+
+   process group   a set of processes signaled as one unit
+   session         a set of groups owning one controlling terminal
+   foreground group  the group allowed to read the terminal
+   setsid          detach: new session, no terminal
+   daemon          a process with no user, no tty, long life
+   double fork     setsid legality + permanent terminal immunity
+   rlimit          kernel-enforced caps on what a process may use
+   pidfile         the daemon's way of publishing its pid
+
+   Rules that keep process-control code correct:
+     1. background readers get SIGTTIN; foreground groups get SIGINT;
+     2. setpgid from BOTH parent and child to beat the race;
+     3. a group leader cannot setsid(); fork first;
+     4. daemons: chdir("/"), umask(022), close + redirect 0,1,2;
+     5. a daemon's only master is a signal: handle SIGTERM/SIGHUP.
+\end{verbatim}
+
+\begin{osconcept}
+This chapter was the OS as a \emph{sociologist}: grouping processes,
+assigning them to terminals, capping their appetite, and adopting
+their orphans. Every mechanism was kernel state---groups, sessions,
+limits---because only the kernel can enforce rules across processes
+that do not trust each other. You are not writing these rules; you are
+\emph{negotiating} them through syscalls, and knowing the shape of the
+negotiation is what systems programming is.
+\end{osconcept}
+
+With process control in hand, we have the full single-machine toolkit:
+files, processes, signals, pipes, and daemons. The next chapter turns
+to the fast lane of communication---time, timers, and the polling
+mechanisms that let one process watch many channels at once without a
+thread per channel.
+

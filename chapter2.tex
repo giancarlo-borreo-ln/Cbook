@@ -1,0 +1,1065 @@
+% ============================================================================
+%  chapter2.tex
+%  Registers: From the Register Image Down to the Atom
+% ============================================================================
+
+\chapter{Registers: The Bistable Heart of the Machine}
+
+\section{A Snapshot of the Whole Machine}
+
+A process is running. It has just finished one instruction and is
+about to start the next when the operating system decides that
+another process deserves the CPU. The machine must not lose the
+process that was running---a few milliseconds from now it will come
+back and finish exactly where it left off.
+
+So the CPU does something extraordinary: it photographs itself. It
+copies into memory everything that defines ``where this computation
+stands''---which instruction runs next, where the stack points, the
+value of every local the compiler is juggling---and later, when the
+process returns, it restores the photograph and the computation
+continues as if nothing had happened. Chapter~5 will call this
+snapshot the \emph{register image}, and Chapter~11 will show a thread
+switch saving and restoring it, byte by byte.
+
+\begin{verbatim}
+   The register image of an x86-64 process, mid-context-switch:
+
+   RAX  0x000000000000003f     R9   0x00007ffc1004d0
+   RCX  0x0000000000000001     R10  0x0000000000000000
+   RDX  0x0000000000000000     R11  0x0000000000000246
+   RBX  0x0000000000000000     R12  0x0000000000000000
+   RSP  0x00007ffc1004f0       R13  0x0000000000000000
+   RBP  0x00007ffc1004f0       R14  0x0000000000000000
+   RSI  0x00007ffc1004d0       R15  0x0000000000000000
+   RDI  0x0000000000000001
+   RIP  0x0000000000401167     (the next instruction)
+   RFLAGS 0x0000000000000202   (carry, zero, sign, ...)
+\end{verbatim}
+
+Sixteen general-purpose registers at eight bytes each, plus the
+instruction pointer and the flags: 128 bytes of ordinary, unglamorous
+data. And yet those 128 bytes are the whole machine, suspended in
+mid-thought. Every computation that will ever run on this CPU spends
+its working life inside them.
+
+\begin{osconcept}
+None of this saving and restoring happens on its own. The decision to
+interrupt a running process, the choice of \emph{which} process runs
+next, and the obligation to put the old process's 128 bytes away and
+lift another's back out are all made by the \emph{scheduler}, a piece
+of the kernel. A thread switch is, in the most literal sense, an
+exchange of register images; Chapter~11 will write that exchange by
+hand. Registers are hardware, but their contents are handed between
+processes only because the OS supervises the transfer.
+\end{osconcept}
+
+That is the image this chapter is about. By its end you will know,
+bit by bit, what it is made of---because underneath those 128 bytes
+lies a ladder of smaller and smaller things. A register. A
+flip-flop. Two logic gates. A pair of transistors. And finally, a few
+billion silicon atoms, a handful of which have been swapped for
+dopants. Let us climb down.
+
+\section{The Register: One Word, Sixty-Four Flip-Flops}
+\label{sec:register}
+
+The image is sixteen words. A \emph{word} is the machine's natural
+unit (Chapter~1), and each word in the image lives in a
+\emph{register}---a small store on the CPU die itself, nanoseconds
+away, managed entirely by your program.
+
+A register is not mysterious. It is a row of storage cells, one per
+bit: sixty-four cells for a 64-bit register. Each cell is a
+\emph{flip-flop}, a circuit that can remember a single 0 or 1, and
+all sixty-four flip-flops in a register share one \emph{clock} line
+so that the whole word changes at the same instant. When the compiler
+emits \code{mov rax, 42}, the CPU drives 42 onto the data lines and
+pulses the clock; on that pulse every flip-flop captures its bit, and
+\code{rax} now holds 42.
+
+\begin{verbatim}
+   A 64-bit register is 64 flip-flops and one clock:
+
+       D0 ----->[D Q]----- Q0
+       D1 ----->[D Q]----- Q1
+       ...      [D Q]
+       D63----->[D Q]----- Q63
+
+                 +-------+
+       clock ----> all 64: on the rising edge each captures its D.
+                 +-------+
+\end{verbatim}
+
+The shared clock is what makes a register \emph{one object} rather
+than sixty-four coincidences: the whole word is latched in a single
+tick. That is why a register has the byte size of a word, why the
+register image is laid out in 8-byte units, and why your program can
+treat a register as an indivisible thing.
+
+The sixteen registers are not interchangeable. The machine gives each
+one a personality, and the compiler and the hardware agree on it:
+
+\begin{verbatim}
+   RAX   accumulator: arithmetic results, function return values
+   RCX   counted loops; the first "loop counter" a machine ever had
+   RDX   data/remainder; the high half of wide arithmetic
+   RBX   a callee-saved scratch register
+   RSP   the stack pointer: where the top of the stack is
+   RBP   the base/frame pointer: where the current frame starts
+   RSI   source index: string ops, second function argument
+   RDI   destination index: string ops, first function argument
+   R8..R15  a general-purpose pool added by the 64-bit extension
+\end{verbatim}
+
+Most of these roles are convention, not law---the CPU will happily do
+arithmetic in \code{r15}---but the convention is so deeply baked into
+compilers, debuggers, and system call interfaces that your code
+should treat it as the layout of the machine. \code{rsp} and
+\code{rbp} in particular are \emph{hard} convention: Chapter~6 will
+show the stack machinery that depends on them.
+
+\begin{insight}[Why sixteen?]
+The number of registers is an accident of instruction encoding. Each
+instruction that names two registers must fit those names into a few
+bits; \code{R8}--\code{R15} came with a 64-bit extension byte added
+to that encoding. A machine with 32 or 128 registers is perfectly
+possible---and modern out-of-order CPUs secretly have far more---but
+\emph{architecturally}, the number is whatever the instruction format
+can address.
+\end{insight}
+
+Now the question this chapter descends toward: what is a flip-flop,
+that it can hold a bit?
+
+\section{Down One Level: The Flip-Flop}
+\label{sec:flipflop}
+
+A flip-flop's ancestor is the \emph{SR latch}, and the SR latch is
+almost absurdly simple: two logic gates wired so that each gate's
+output is one of the other gate's inputs. With no inputs asserted,
+the circuit is just a loop. And that loop is a memory.
+
+\begin{verbatim}
+   The SR latch: two NOR gates, cross-coupled.
+
+         S -------------------------+
+                                     v
+                        +-----------------------+
+                        |          NOR          |
+                        |                       |----------- Q
+                        +-----------------------+
+                              ^
+                              |   (Qbar feeds back)
+                        +-----------------------+
+                        |          NOR          |
+                        |                       |----------- Qbar
+                        +-----------------------+
+                              ^
+         R --------------------+
+\end{verbatim}
+
+This is the drawing you will find in Wikipedia's flip-flop article
+and in every digital-logic textbook; in vacuum-tube form it dates to
+the 1918 Eccles--Jordan trigger relay. A NOR gate outputs 1 exactly
+when both its inputs are 0, which gives the latch a tiny truth table:
+
+\begin{verbatim}
+   S   R   action
+   --- --- -----------------------------------
+   1   0   set     : Q = 1 (the latch remembers 1)
+   0   1   reset   : Q = 0 (the latch remembers 0)
+   0   0   hold    : Q stays wherever it was
+   1   1   forbidden: both outputs collapse; never drive this
+\end{verbatim}
+
+Force S to 1 and Q rises; the lower NOR sees that high and its output
+falls; and when you let go of S, the loop is on its own---and it
+stays exactly where it is, because each gate holds the other in
+place. That is the entire mechanism of computer memory in one
+sentence: \emph{a loop that reinforces itself}.
+
+A bare latch is transparent---a stray signal can flip it at any time.
+A CPU wants its registers to change only at agreed instants, so the
+flip-flops it uses are \emph{edge-triggered D flip-flops}: one data
+input, one clock, and the rule that the output changes only on the
+clock's rising edge, and only to whatever the data input held at that
+exact moment. A D flip-flop is two latches in series---master and
+slave, opened on opposite clock phases---so it samples, then holds,
+with no window for accidental change. Sixty-four of them sharing one
+clock is the register of Section~\ref{sec:register}.
+
+\begin{verbatim}
+   A D flip-flop as master and slave, one data path:
+
+         D ---->[master latch]----[slave latch]----> Q
+                       |                  |
+                       +--------+---------+
+                                |
+                                v
+                          clock (inverted for one of them)
+   On the rising edge the master opens and samples D; the slave is
+   locked. On the falling edge the master locks and the slave opens,
+   copying the sampled value to Q. The output therefore changes only
+   around the clock edge, never in between.
+\end{verbatim}
+
+\section{Why the Loop Holds: Bistability and the Math of Feedback}
+\label{sec:bistable}
+
+The latch holds because it is \emph{bistable}: it has exactly two
+stable states, and every other state is shoved toward one of them.
+The mathematics is clean, and worth holding in your hands.
+
+Model each NOR gate as a sharp inverting element. With $Q$ and
+$\bar{Q}$ the two stored nodes, the pair of gates imposes
+
+\begin{equation}
+Q = \overline{S \lor \bar{Q}}, \qquad \bar{Q} = \overline{R \lor Q},
+\end{equation}
+
+where $\lor$ is logical OR and the overbar is negation. In the hold
+condition ($S = R = 0$) this collapses to
+
+\begin{equation}
+Q = \overline{\bar{Q}}, \qquad \bar{Q} = \overline{Q},
+\end{equation}
+
+which has exactly two solutions: $Q=1,\ \bar{Q}=0$ and $Q=0,\
+\bar{Q}=1$. A third, formal solution---$Q$ and $\bar{Q}$ both
+halfway---exists on paper but not in practice: it is an
+\emph{unstable} equilibrium. The tiniest noise tips the loop, and
+positive feedback then races it all the way to one of the stable
+corners. That razor's edge is called \emph{metastability}, and it is
+why real hardware occasionally hiccups when two signals race.
+
+The analogue view says the same thing with a picture. An inverter's
+output $v_{out}$ is a function $f$ of its input; two inverters in a
+loop must satisfy $v_{out} = f\bigl(f(v_{out})\bigr)$. Because $f$
+is inverting and steeper than $-1$ at its midpoint, the composition
+crosses the diagonal three times: the two stable points and the
+unstable middle.
+
+\begin{verbatim}
+   v_out
+   1 |  x                     stable: Q = 1
+     |    .
+     |     .     the middle diagonal crossing is the
+     |       .        .       metastable point: unstable
+     |        .    .
+     |           .  x         stable: Q = 0
+   0 +----------------------------- v_in
+\end{verbatim}
+
+That is the mathematical reason a register does not ``half-remember'':
+the loop has no resting place between 0 and 1, so it cannot rest
+there. A flip-flop is \emph{static} memory---it holds its two stable
+voltages as long as power flows, needing no help. There is a second,
+dynamic family, the DRAM capacitor, whose retention is a race against
+leakage and whose math is even more explicit. Both families are built
+from the same two ingredients, which is the next level down.
+
+\section{The Clock: Making a Million Flip-Flops Agree}
+\label{sec:clock}
+
+Every register in the CPU is edge-triggered, and edge-triggering only
+means something if every edge arrives at the same instant across the
+whole die. That agreement is the job of the \emph{clock}: a single
+square wave, distributed to every flip-flop, that ticks once per
+cycle. At roughly 3--5 billion ticks a second in a modern CPU, each
+tick lasts about a third of a nanosecond.
+
+\begin{verbatim}
+   The clock, drawn against time (t is running to the right):
+
+   clock   ____|----|____|----|____|----|____|----|____
+                  ^         ^         ^         ^
+              rising edges: on each one, every flip-flop in the
+              CPU samples its D input and changes exactly then.
+\end{verbatim}
+
+A synchronous machine is a heartbeat: flip-flops remember, and the
+combinational logic \emph{between} registers---gates wired in a
+straight line, no loops---does the computing during the quiet part of
+each cycle. One tick to sample, one interval to compute, one tick to
+latch the answer, and the whole machine advances in lockstep. This is
+why your program sees registers change ``all at once'' and never
+``in mid-thought'': the clock simply does not allow half-updated
+words.
+
+\subsection{Setup and Hold: The Flip-Flop's Polite Window}
+
+A flip-flop samples on the edge, but it needs a moment of peace around
+that edge. The data must be settled and steady for a short time
+\emph{before} the edge---the \emph{setup time}, $t_{su}$---and must
+stay put for a short time \emph{after} it---the \emph{hold time},
+$t_{h}$. These are physical facts about the transistors inside the
+flip-flop, on the order of tens of picoseconds.
+
+\begin{verbatim}
+   The window a flip-flop demands around a rising edge:
+
+   clock    ____|----|________|----|____
+                        ^
+   D input  ____|_______________|________
+             <-- stable high --><-- stable low
+                        |<- t_su ->|<- t_h ->|
+                        D must not change inside this window.
+
+   Violate it, and the flip-flop does not guarantee a clean 0 or 1:
+   it may sit halfway, decide randomly, or take a while to decide.
+\end{verbatim}
+
+Setup and hold are the price of agreeing on \emph{when}. The clock
+must arrive at every flip-flop at nearly the same time (a skew of a
+few dozen picoseconds is acceptable), the combinational logic must
+finish within the cycle, and no signal may sneak through a latch
+while its data is still being written. Engineers design for these
+rules with static timing analysis; your program never sees them,
+because the CPU is built to meet its own deadlines by construction.
+
+\subsection{Metastability in the Wild: Crossing Asynchronous Borders}
+
+Metastability is not an academic footnote. It appears the moment
+something \emph{asynchronous} touches the clocked machine: a keyboard
+key, a network packet, a disk interrupt. Those signals do not march to
+the CPU's clock, so when a flip-flop samples them, the sample can land
+right inside the forbidden window---and the flip-flop goes metastable,
+hesitating between 0 and 1 for a while before tumbling to one side.
+
+The trick is to not care which side it falls on. A
+\emph{synchronizer} is two flip-flops in a row fed by the same clock:
+the first may go metastable, but it has a whole clock cycle to settle,
+and the second flip-flop samples it \emph{after} that, by which time
+it is a solid 0 or 1. We lose a cycle of latency; we gain a guarantee
+that the value the logic sees is a clean bit.
+
+\begin{verbatim}
+   Two flip-flops turning an async input into a safe signal:
+
+        async in --->[D Q]---->[D Q]----> into the clocked logic
+                      flop 1    flop 2
+                         |         |
+                         +----+----+
+                              |
+                              v
+                          the one clock (both flops)
+
+   flop 1 has one full clock to resolve; flop 2 then samples a
+   settled value. The value is "arbitrary," but it is never
+   mid-flight, and that is what the rest of the machine needs.
+\end{verbatim}
+
+That is why hardware ``occasionally hiccups'' in the face of racing
+signals: no synchronizer is perfect, and with enough samples the
+first flop occasionally takes longer than a cycle to decide. The
+failure rate is not zero---it is merely small---and how small is a
+measured engineering quantity. It is also exactly why every external
+interrupt in the kernel arrives through hardware that has already
+been synchronized before it ever reaches a register.
+
+\begin{researchnote}[Metastability is measured, not guessed]
+The frightening part of metastability is that a synchronizer can
+theoretically sit unresolved forever. In practice it cannot, but the
+failure rate is governed by a stark formula. For a two-flip-flop
+synchronizer given a resolution time $t_r$, the mean time between
+failures is roughly
+
+\begin{equation}
+\text{MTBF} \approx \frac{e^{t_r / \tau}}{T_0\, f_\text{clk}\, f_\text{data}},
+\end{equation}
+
+where $f_\text{clk}$ and $f_\text{data}$ are the clock and data
+frequencies and $T_0$ and $\tau$ are constants of the flip-flop
+technology. The exponential in the numerator is the whole story:
+each extra clock cycle of resolution time buys an astronomically
+larger MTBF. Thomas Chaney and Charles Molnar proved the phenomenon
+was fundamental, not a manufacturing flaw, in 1973, and the formula
+appears in nearly every serious digital-design text since.
+
+\paperref{T.~J.~Chaney, C.~E.~Molnar, ``Anomalous Behavior of
+Synchronizer and Arbiter Circuits,'' IEEE Transactions on Computers,
+1973}{https://ieeexplore.ieee.org/document/1672263}
+\end{researchnote}
+
+\begin{ruleofthumb}[Synchronize before you trust]
+In software terms, treat every value that arrives from outside the
+clocked core---a pressed key, a network byte, a changed file---as
+asynchronous and therefore suspect. The hardware synchronizer turns a
+``maybe metastable'' bit into a ``settled, but arbitrary'' bit; your
+program's job is to re-validate that arbitrary value (parse it, check
+it) before trusting it. The register image itself never needs this
+treatment: everything in it lives on the clock.
+\end{ruleofthumb}
+
+\section{Down Another Level: Transistors and Capacitors}
+\label{sec:transistors}
+
+The gates and inverters above are not symbols; each is built from
+\emph{field-effect transistors}, which are voltage-controlled
+switches. A voltage on the gate opens or closes a channel for
+current. A CMOS inverter is two transistors: an n-type one that
+conducts when its input is high and pulls the output low, and a
+p-type one that conducts when the input is low and pulls the output
+high.
+
+\begin{verbatim}
+   A CMOS inverter: one p-type and one n-type transistor.
+
+           Vdd
+            |
+           [P]    p-type: on when input is 0
+            |----- output
+           [N]    n-type: on when input is 1
+            |
+          GND
+
+   input = 1 -> N on, P off -> output 0
+   input = 0 -> P on, N off -> output 1
+\end{verbatim}
+
+A static RAM (SRAM) cell---the flip-flop of Section~\ref{sec:flipflop}
+drawn in silicon---is six transistors: two cross-coupled inverters
+(four transistors) that hold the bit, plus two \emph{access}
+transistors that connect the cell to the bit lines when the row's
+word line is high. Read or write, the cell is a tiny latch, exactly
+the loop of the previous section.
+
+\begin{verbatim}
+   The 6-transistor SRAM cell: the two inverters, plus access.
+
+            Vdd                     Vdd
+             |                       |
+            [P1]                    [P2]     <- pull-up transistors
+             |                       |
+             +--- Q ----+---- Qbar --+
+             |          |            |
+            [N1]       [A1]        [A2]     <- access transistors
+             |          |            |
+           GND     bit line     bit line bar
+                         \        /
+                          +------+--------- word line (their gates)
+
+   word line low  : A1, A2 open   -> the cell floats, holding Q
+   word line high : A1, A2 closed -> bit lines read or write Q
+   The two inverters actively pump Q and Qbar to the rails, which is
+   why SRAM never needs refreshing.
+\end{verbatim}
+
+A dynamic RAM (DRAM) cell is leaner: one access transistor and one
+\emph{capacitor}. The bit is simply whether the capacitor holds
+charge. That frugality is why DRAM is cheap and dense---and its cost
+is that the charge leaks away and must be \emph{refreshed} on a
+timer.
+
+\begin{verbatim}
+   A DRAM cell: one transistor, one capacitor.
+
+        word line
+            |
+            v
+           [T]     the access transistor
+            |
+   bit line ---+====   the storage capacitor (the bit)
+               |
+              gnd
+\end{verbatim}
+
+Here is the retention math, concrete and vivid. A capacitor stores
+charge $Q = C\,V$. A leakage current $I$ drains it at
+
+\begin{equation}
+\frac{dV}{dt} = -\frac{I}{C},
+\end{equation}
+
+and if the leak behaves like a resistance $R$, the voltage decays as
+
+\begin{equation}
+V(t) = V_0\,e^{-t/RC}.
+\end{equation}
+
+Take a modern cell: roughly $C \approx 25$ fF and a standby leakage
+of about a picoampere. Then $dV/dt \approx 40$ V/ms, so a stored
+voltage of about a volt falls below the sensing threshold within ten
+to twenty milliseconds. That is why the JEDEC standard insists every
+DRAM row be refreshed at least every 64 ms---the memory must be
+re-read and topped up before its bits fade into noise. The register's
+flip-flops need no such clock: their inverters actively pump the
+stored node back to the rail, which is why the register image holds
+its values while the power is on.
+
+\begin{verbatim}
+   Two families, one difference:
+
+                         holds the bit        refreshed?
+   register flip-flop    active inverter      never (static)
+   SRAM cell             active inverter      never (static)
+   DRAM cell             a passive capacitor  every ~64 ms
+
+   Static families actively pump their bit; dynamic families store
+   charge and fight leakage. Everything else is the same loop.
+\end{verbatim}
+
+\begin{insight}[The cache hierarchy is this section in disguise]
+Chapter~1's memory hierarchy is a ladder of exactly these cells.
+L1/L2/L3 cache is SRAM---cross-coupled inverters, no refresh, fast
+but expensive. Main memory is DRAM---one transistor and a capacitor,
+cheap and dense, refreshed continuously by the memory controller.
+And the register file is the fastest SRAM of all, right at the top
+of the ladder. Every ``level'' you met in Chapter~1 is one of the two
+circuits drawn here, scaled up.
+\end{insight}
+
+\section{The Bottom: Chemistry, Silicon, and a Handful of Electrons}
+\label{sec:chemistry}
+
+What are those transistors and capacitors made of? Silicon, arranged
+in a crystal, with a few of its atoms deliberately replaced. This is
+the chemistry underneath every bit your program has ever stored.
+
+Pure silicon is a semiconductor. Each atom shares four valence
+electrons in a perfect lattice, so at room temperature almost nothing
+conducts. \emph{Doping} changes that by substituting a handful of
+atoms:
+
+\begin{itemize}
+  \item \emph{Phosphorus} brings five valence electrons and donates
+    a free one: the material becomes \emph{n-type}, full of mobile
+    electrons.
+  \item \emph{Boron} brings three valence electrons and leaves a
+    missing bond---a \emph{hole} that moves like a positive
+    charge---and the material becomes \emph{p-type}.
+\end{itemize}
+
+A transistor is a p-type body with n-type source and drain, a few
+nanometres of silicon dioxide on top, and a metal gate. Raise the
+gate voltage and its electric field pulls electrons to the surface,
+forming an \emph{inversion channel} that connects source to drain.
+No field, no channel, no current: that is the voltage-controlled
+switch of the previous section, made of silicon and a sprinkling of
+boron and phosphorus atoms. At doping levels near $10^{17}$ atoms per
+cubic centimetre, roughly one silicon atom in a million is a dopant;
+the ``free'' electrons that carry a signal are donations from those
+rare, chosen atoms.
+
+\begin{verbatim}
+   The chemistry of a switch:
+
+        gate
+          |
+         SiO2    (a nanometre of glass)
+     n+  | p-type | n+
+     S   | channel| D
+         |  (electrons pulled in by the gate's field)
+
+     electrons are the carriers; holes are their absence.
+\end{verbatim}
+
+Leakage, the enemy of the DRAM capacitor, is a chemistry story too.
+An ``off'' transistor still lets a few carriers slip through the
+barrier, and subthreshold leakage grows exponentially as devices
+shrink. A modern DRAM cell stores its bit as only tens of thousands
+of electrons; every time the cell shrinks it holds fewer, leaks
+faster, and must be refreshed more aggressively. The famous scaling
+rule---R.~H.~Dennard's 1974 prediction that smaller transistors would
+stay fast and cool---broke precisely because of this chemistry of
+tunnelling and leakage. That is why the industry moved to new
+dielectrics, finFETs, and three-dimensional transistors: the deepest
+detail on this ladder is where Moore's law meets its limit.
+
+\begin{verbatim}
+   The full descent, one ladder:
+
+   register  -> 64 flip-flops sharing a clock
+   flip-flop -> two cross-coupled inverting gates, edge-triggered
+   gate      -> a pair of transistors (CMOS inverter, NOR, ...)
+   transistor-> a sliver of doped silicon with a field-effect switch
+   silicon   -> a crystal of atoms, a handful doped with P or B
+   bit       -> the presence or absence of electrons at one node
+\end{verbatim}
+
+\section{Back Up: The Image, Understood}
+\label{sec:backup}
+
+Let us return to the opening scene. The process is interrupted; the
+CPU photographs itself; 128 bytes of register image go into memory.
+Now you know what those bytes are:
+
+\begin{verbatim}
+   one bit      = one flip-flop = two cross-coupled gates
+                = four to six transistors = a loop of doped silicon
+   one register = 64 flip-flops sharing a clock   (8 bytes)
+   the image    = 16 registers + RIP + RFLAGS     (128 bytes)
+\end{verbatim}
+
+The register image is not a metaphor. It is 128 bytes of bistable
+loops---each loop a pair of gates, each gate a pair of transistors,
+each transistor a sliver of doped silicon---sitting on the CPU die
+and holding the exact state of a computation because each loop
+actively refuses to change. That refusal, powered by positive
+feedback and paid for elsewhere with leakage and refresh, is the
+deepest reason the data structures, processes, and databases of this
+book work at all.
+
+\begin{insight}[Every byte you store is this story]
+The 128-byte register image is the fastest memory there is, and its
+cousins---L1 cache, SRAM, DRAM, disk---are the same story at larger
+scale. Cache is SRAM: more cross-coupled inverters, still static,
+still loop-held. RAM is DRAM: capacitors racing leakage, refreshed
+64 times a second. The hierarchy of Chapter~1 is, from the bottom up,
+a ladder of the very same physics you just descended.
+\end{insight}
+
+\section{Registers at Work: The Datapath and the ALU}
+\label{sec:datapath}
+
+The descent is complete, so let us watch the image \emph{work}. A
+register's job is not to sit still; it is to feed a computation. The
+machine that does the feeding is the \emph{datapath}: the register
+file (all sixteen registers in one bank), the arithmetic/logic unit
+(the \emph{ALU}), and the wires that connect them. Every instruction
+you will ever compile is a script for this small, closed system.
+
+\begin{verbatim}
+   The instruction loop of one add rax, rbx, step by step:
+
+        +--------+      +--------+      +--------+
+        |  RIP   |      |  RAX   |      |  RBX   |   register file
+        +--------+      +--------+      +--------+
+           |    ^           ^               ^
+           |    |           |               |
+           |    |       read port A     read port B
+           |    |
+           |  +-----------------------------+
+           |  |          control logic      |  "add"
+           |  +-----------------------------+
+           |            |          |
+           |            v          v
+           |        +---------------+
+           |        |     ALU       |  computes RAX + RBX
+           |        +---------------+
+           |            |
+           |      +-----+------------+-----------------+
+           |      |                  |                 |
+           |      v                  v                 v
+           |  write port -> RAX   RFLAGS           result discarded
+           |                          (CF, ZF, SF, OF set)
+           +--- RIP advances past the instruction; repeat forever
+\end{verbatim}
+
+1. \textbf{Fetch.} The instruction pointer \code{rip} holds the
+address of the next instruction's bytes in memory. The CPU reads
+those bytes and advances \code{rip} past them.
+2. \textbf{Decode.} The control logic works out what the bytes mean:
+``add the value in \code{rbx} to the value in \code{rax}.''
+3. \textbf{Read.} The register file places \code{rax} on read port
+A and \code{rbx} on read port B. Two reads in the same tick is what
+the two ports are \emph{for}.
+4. \textbf{Execute.} The ALU computes the sum and, as a side effect,
+latches the result's meaning into \code{rflags}: whether it was zero
+(\code{ZF}), negative (\code{SF}), carried out (\code{CF}), or
+overflowed (\code{OF}).
+5. \textbf{Write.} On the clock edge, the result is written back
+into \code{rax} through the write port, and the whole loop repeats.
+
+Three registers you already know appear here in their true roles.
+\code{rip} is the machine's cursor into the program; \code{rflags}
+is the machine's memory of what the last computation \emph{meant};
+and the register file is the working surface the ALU reads from and
+writes to. An add is a fetch, a decode, a read, an add, a write---and
+a handful of clock cycles, in a machine that does billions of them a
+second.
+
+\begin{insight}[Architectural vs.\ physical registers]
+The sixteen registers your program sees are the \emph{architectural}
+register file: the ones Chapter~5 saves and Chapter~11 restores. A
+modern out-of-order CPU keeps a much larger \emph{physical} register
+file underneath---hundreds of cells---and renames the architectural
+names onto physical cells so that independent instructions can use
+the same \code{rax} in the same tick without colliding. Your program
+only ever sees the sixteen names; the renaming is invisible magic
+that makes the datapath faster. The image you save is still 128
+bytes, because the contract with your program is the architectural
+file.
+\end{insight}
+
+\section{RFLAGS, Bit by Bit: How a Comparison Decides a Branch}
+\label{sec:rflags}
+
+The flags are easy to ignore and impossible to avoid. Every
+arithmetic instruction sets them; every conditional branch reads
+them; and compilers generate code that lives and dies by them. In the
+register image they are a single 64-bit word, but only a handful of
+the bits carry meaning:
+
+\begin{verbatim}
+   The meaningful bits of RFLAGS (x86-64):
+
+   bit   name  meaning
+   ---   ----  ------------------------------------------------
+   0     CF    carry: unsigned overflow from the last operation
+   2     PF    parity: the low byte of the result had even parity
+   4     AF    auxiliary carry: bit 3 carried (BCD arithmetic)
+   6     ZF    zero: the result was exactly zero
+   7     SF    sign: the result is negative (its top bit is set)
+   8     TF    trap: single-step, used by debuggers
+   9     IF    interrupt enable: maskable interrupts are allowed
+   10    DF    direction: string instructions move up or down
+   11    OF    overflow: signed overflow from the last operation
+\end{verbatim}
+
+The six arithmetic flags---\code{CF, PF, AF, ZF, SF, OF}---are the
+ALU reporting on its own work. The trick that makes them powerful is
+that a comparison is just a subtraction that throws away its result.
+The instruction \code{cmp a, b} computes $a - b$ and sets the flags
+exactly as a subtraction would, but stores nothing. The branch that
+follows then reads the flags as an answer.
+
+Consider the simplest possible overflow, on paper:
+
+\begin{verbatim}
+   add rax, rbx      rax = 0x7fff...ffff   rbx = 1
+
+   result:           0x8000...0000
+     unsigned view:  2^63 - 1 + 1 = 2^63, which fits  -> CF = 0
+     signed view:    (2^63 - 1) + 1 = 2^63, which as a signed
+                     64-bit number is negative -> overflow -> OF = 1
+     zero?  no -> ZF = 0       sign? top bit set -> SF = 1
+\end{verbatim}
+
+One operation, two honest answers: \code{CF} reports the truth to
+unsigned arithmetic, \code{OF} to signed. That is why there are two
+families of conditional jumps. Unsigned comparisons (\code{jb}, \code{ja},
+``below/above'') test \code{CF} and \code{ZF}; signed comparisons
+(\code{jl}, \code{jg}, ``less/greater'') test \code{SF} against
+\code{OF}. The same bytes, the same flags, two different readings.
+
+Let a compiler show it. This C function
+
+\begin{lstlisting}[caption={A branch the compiler will turn into flags.}]
+int max(int a, int b) {
+    if (a > b) {
+        return a;
+    } else {
+        return b;
+    }
+}
+\end{lstlisting}
+
+compiles (unoptimized, so the branch is visible) into something very
+close to this:
+
+\begin{verbatim}
+   max:
+       pushq  %rbp
+       movq   %rsp, %rbp
+       movl   %edi, -8(%rbp)     a lives on the stack
+       movl   %esi, -12(%rbp)    b lives on the stack
+       movl   -8(%rbp), %eax     eax = a
+       cmpl   -12(%rbp), %eax    compute a - b, set flags, keep nothing
+       jle    .L2                if a <= b (signed) go load b
+       movl   -8(%rbp), %eax     the a > b path: return a
+       jmp    .L3
+   .L2:
+       movl   -12(%rbp), %eax    the else path: return b
+   .L3:
+       popq   %rbp
+       ret
+\end{verbatim}
+
+(Exact output varies with compiler and version, but the shape is
+universal.) The compare sets \code{CF}, \code{ZF}, \code{SF}, and
+\code{OF} from $a - b$; \code{jle} then jumps if the subtraction said
+``less than or equal'' in signed terms---that is, if $\text{ZF}=1$ or
+$\text{SF} \ne \text{OF}$. A modern optimizer notices the branch is
+short and replaces the whole dance with \code{cmov}, a conditional
+\emph{move} that reads the same flags without branching. The flags
+are the machine's internal vocabulary for ``how did that
+comparison go?'', spoken in every branch your program ever takes.
+
+\begin{insight}[Flags are a side effect]
+Arithmetic sets the flags whether you want them or not. A stray
+\code{add} in unrelated code silently rewrites \code{ZF}, which is
+why the hardware convention is that branches must immediately follow
+the comparison they depend on---and why compilers reorder your code
+with such care. In assembly, a comparison is not data until the
+branch consumes it. This pairing---set flags, consume flags---is the
+lowest-level control flow your code will ever see.
+\end{insight}
+
+\begin{ruleofthumb}[Unsigned or signed: pick by the type]
+When you compare two \code{size\_t} or \code{unsigned} values, the
+compiler emits unsigned branches testing \code{CF} and \code{ZF};
+when you compare \code{int} or \code{long}, it emits signed branches
+testing \code{SF} against \code{OF}. Mixing the two is the classic
+one-off bug (``\code{size\_t} is huge when it underflows'') that
+Chapter~1's Loop Counter Rule exists to prevent. The flags remember
+both readings; the instruction chooses which to consult.
+\end{ruleofthumb}
+
+\section{Practical Exercise: See Your Program's Register Image}
+\label{sec:practical}
+
+The opening scene of this chapter was a register image, but you have
+probably never seen your \emph{own} program's registers. Let us fix
+that. Two tools show you the fastest memory there is: a debugger to
+dump it live, and the compiler to show how your C becomes register
+moves.
+
+\subsection{Dumping the image with gdb}
+
+Write a tiny program, compile it with debug symbols, and stop it
+inside a function:
+
+\begin{lstlisting}[caption={max.c: the function from the previous section.}]
+#include <stdio.h>
+
+int max(int a, int b) {
+    if (a > b) {
+        return a;
+    } else {
+        return b;
+    }
+}
+
+int main(void) {
+    printf("max(7, 11) = %d\n", max(7, 11));
+    return 0;
+}
+\end{lstlisting}
+
+Compile with debug info and run it under the debugger:
+
+\begin{verbatim}
+   $ gcc -O0 -g -o max max.c
+   $ gdb ./max
+   (gdb) break max
+   (gdb) run
+   (gdb) info registers
+\end{verbatim}
+
+Because we break at the \emph{entry} of \code{max}, before any of its
+own instructions run, the general-purpose registers still show the
+calling convention in action: the first two integer arguments arrived
+in \code{rdi} and \code{rsi}. You are looking at the register image
+of a live computation---the 128 bytes of Chapter~2, mid-flight.
+
+\begin{verbatim}
+   rax            0x0                 0
+   rbx            0x0                 0
+   rdi            0x7                 7        <- first argument
+   rsi            0xb                 11       <- second argument
+   rsp            0x7fffffffe3d8      0x7fffffffe3d8
+   rbp            0x7fffffffe3d0      0x7fffffffe3d0
+   rip            0x401136            0x401136 <max>
+   eflags         0x202               [ IF ]
+\end{verbatim}
+
+Try \code{next} a few times and watch \code{eflags} change as the
+\code{cmp} and \code{jle} execute; then \code{continue} and watch the
+return value land in \code{rax}. This is not a simulation. Every value
+you see is held by cross-coupled loops of doped silicon, and a
+\code{context switch} would freeze exactly these bytes to disk-shaped
+memory and restore them later.
+
+\subsection{Following your data through the compiler}
+
+The debugger shows you the live image; the compiler shows you how it
+was produced. Ask \code{gcc} for assembly instead of a binary:
+
+\begin{verbatim}
+   $ gcc -O2 -S max.c
+   $ cat max.s
+\end{verbatim}
+
+At \code{-O2} the optimizer has made the branch disappear---the
+\code{cmov} mentioned in the previous section---and the whole
+function is a handful of instructions. The calling convention is
+readable in the input names: \code{edi} and \code{esi} (the low 32
+bits of \code{rdi} and \code{rsi}) enter, and the answer leaves in
+\code{eax}. If you know where the arguments and the return value
+live, you can read almost any function's skeleton without a manual.
+
+\begin{verbatim}
+   The calling convention (x86-64 System V), in one line:
+
+   args 1-6 : rdi, rsi, rdx, rcx, r8, r9    return: rax
+   callee-saved: rbx, rbp, r12-r15          caller-saved: the rest
+\end{verbatim}
+
+This convention is part of why the register image has the shape it
+does. The callee-saved registers are the ones a function must restore
+before returning---so a context switch only needs to save \emph{its}
+working set, while the hardware and the compiler split the rest by
+this rule. When Chapter~5 serializes a register image and Chapter~11
+saves it across a thread switch, this table is the key to what gets
+saved, and when.
+
+\subsection{What to do when registers are not enough}
+
+A running program needs more than sixteen words. Function arguments
+beyond the sixth, large locals, and array indices all spill into
+memory---onto the stack and heap of Chapter~1. The register file is
+the fastest memory a program has, but it is also the smallest, and
+the compiler's endless job is to decide which words deserve a
+register and which must be spilled. Run \code{gcc -O0 -S} on the same
+\code{max.c} and you will see the spilled version from the previous
+section: everything parked on the stack, registers barely used. Run
+\code{-O2} and the spills vanish. That trade---registers for speed,
+memory for capacity---is the oldest trade in computing, and it is
+exactly the hierarchy of Chapter~1 playing out inside a single
+function.
+
+\begin{ruleofthumb}[The register keyword is a fossil]
+C has a keyword, \code{register}, that asks the compiler to keep a
+variable in a register. Modern compilers ignore it almost entirely;
+they have better information than you do about which words are hot,
+and they reallocate freely. The reason it exists is that C was
+written for machines where the answer was not obvious and the
+compilers were not good. Let your compiler do its job, and reserve
+your attention for the part it cannot decide: what \emph{lifetime}
+your data needs, which is the stack-versus-heap question of
+Chapter~1.
+\end{ruleofthumb}
+
+\section{Structures in Bytes}
+\label{sec:structures}
+
+The register file on x86-64, given byte addresses (each register is a
+word, 8 bytes):
+
+\begin{verbatim}
+   general-purpose registers (16 x 8 bytes = 128 bytes):
+
+   RAX   0     RCX   8     RDX  16     RBX  24
+   RSP  32     RBP  40     RSI  48     RDI  56
+   R8   64     R9   72     R10  80     R11  88
+   R12  96     R13  104    R14  112    R15  120
+
+   special registers:
+   RIP      the instruction pointer: which program byte runs next
+   RFLAGS   status bits: carry, zero, sign, overflow, direction...
+
+   one D flip-flop: 1 bit
+   one register:    64 flip-flops = 8 bytes
+   the image:       128 bytes of the fastest storage that exists
+\end{verbatim}
+
+RSP is simultaneously the stack pointer and one of the sixteen
+general registers; RIP and RFLAGS sit just outside the 128-byte file
+but are saved with it on every context switch. This byte map is
+exactly what Chapter~11's thread-scheduling code copies out and back
+in, and it is the ``$\sim$100s B, $\sim$1 ns'' row of Chapter~1's
+hierarchy table, made visible.
+
+Each register is itself a small structure: one storage unit with
+several overlapping views. The \code{rax} word can be addressed as a
+full 64 bits, its low 32, its low 16, or its individual bytes:
+
+\begin{verbatim}
+   RAX, seen as overlapping windows (all of them are the same bytes):
+
+   byte 0   1   2   3   4   5   6   7
+   +---+---+---+---+---+---+---+---+
+   | AL| AH|   AX (16 bits)         |
+   |   EAX (32 bits)                |
+   |   RAX (64 bits)                |
+   +---+---+---+---+---+---+---+---+
+
+   AL   = low 8 bits     AH  = bits 8..15
+   AX   = low 16 bits    EAX = low 32 bits    RAX = all 64
+
+   The register file's second word layer: RAX at bytes 0..7, RCX at
+   8..15, and so on down the file. Writing EAX zeroes the top 32
+   bits of RAX; writing AL leaves them alone.
+\end{verbatim}
+
+This partial-register trick is why the register image in the opening
+scene is a clean 128 bytes while the machine inside happily reads
+half-words and bytes. The file is 128 bytes of structure---sixteen
+8-byte words---and every word is itself a byte map.
+
+The flags word is a structure too, and a bit-level one: each status
+flag is a single bit at a fixed position, which is why the kernel
+reads and writes \code{RFLAGS} with bit tests and masks rather than
+as a number. Section~\ref{sec:rflags} listed the positions; here they
+are as bytes and bits:
+
+\begin{verbatim}
+   RFLAGS as a byte map (meaningful bits only):
+
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   |...|OF|DF|IF|TF|SF|ZF| AF |PF| |CF|
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+      11 10  9  8  7  6   4  2    0
+
+   the other bits are reserved and stay 0, which is why a clean
+   flags word reads 0x202 (IF, plus the always-on reserved bits).
+\end{verbatim}
+
+Two more banks live beside the 128-byte file and are saved with it on
+context switches: the \emph{vector registers} \code{XMM0}--\code{XMM15}
+(sixteen 128-bit words, used by floating point and SIMD) and the
+\emph{segment registers} \code{CS}, \code{DS}, \code{ES}, \code{FS},
+\code{GS}, \code{SS}. Most programs touch only the general file, but
+any code that does heavy float or string work will find its state
+spread across all three banks. When you read a register dump, these
+are the three blocks you are looking at.
+
+\section{Summary}
+
+\begin{verbatim}
+   The register model, complete:
+
+   register     a word of storage on the CPU die
+   flip-flop    one bit: two cross-coupled inverting gates
+   SR latch     set / reset / hold; the ancestor of all of it (1918)
+   D flip-flop  captures D on a clock edge; 64 of them = a register
+   bistability  two stable states; metastable only on the razor edge
+   the clock    the shared edge that makes the whole machine agree
+   setup/hold   a flop needs quiet around the edge; break it -> meta
+   synchronizer two flops that absorb an async signal's uncertainty
+   SRAM         6 transistors, static, no refresh
+   DRAM         1 transistor + 1 capacitor, leaking, refreshed
+   retention    V(t) = V0 e^(-t/RC): why DRAM refreshes every 64 ms
+   datapath     RIP -> decode -> register file -> ALU -> RFLAGS
+   RFLAGS       CF PF AF ZF SF OF: the ALU reporting on its work
+   cmp/jcc      subtract, keep only the flags, branch on the flags
+   chemistry    silicon + phosphorus/boron = the switches
+
+   Rules that keep the model straight:
+     1. a register holds its value only while power flows;
+     2. writes happen on clock edges, all bits of a word together;
+     3. DRAM must be refreshed; SRAM and registers must not;
+     4. the register image is a byte map: 16 x 8 = 128 bytes;
+     5. async inputs get synchronized; the register file never does;
+     6. comparisons set flags; branches read them; never separate them.
+\end{verbatim}
+
+\begin{researchnote}[Two century-spanning inventions]
+The flip-flop is older than the transistor. William Eccles and
+F.~W.~Jordan patented their ``trigger relay''---two amplifying valves
+cross-coupled in a positive feedback loop, the same loop as
+Section~\ref{sec:flipflop}---in 1918, and a quarter-century later it
+was storing the state of the Colossus codebreaking computers. The
+gates-drawn diagram of the SR NOR latch in this chapter is the direct
+descendant of their two vacuum tubes.
+
+The other half of the story is the scaling rule that made registers
+and DRAM cheap. R.~H.~Dennard and colleagues showed in 1974 that
+shrinking transistors could keep power density constant while running
+faster; the chemistry of leakage in Section~\ref{sec:chemistry} is
+the reason that law eventually broke, and it is the same physics that
+forces DRAM to refresh today. The metastability side of the story
+has its own founding paper: Chaney and Molnar's 1973 proof, cited in
+Section~\ref{sec:clock}, that the problem is inherent to synchronizing
+two unrelated clocks.
+
+\paperref{Wikipedia, ``Flip-flop (electronics)''}{https://en.wikipedia.org/wiki/Flip-flop_(electronics)}
+\end{researchnote}
+
+With the machine's fastest memory understood bit by bit, the next
+chapter returns to the programmer's view: Chapter~3 combines scalars
+into \emph{structures}, and shows how the machine's demand for
+aligned access quietly inserts invisible padding bytes between our
+fields.

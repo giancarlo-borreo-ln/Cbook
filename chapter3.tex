@@ -1,0 +1,1008 @@
+% ============================================================================
+%  chapter3.tex
+%  Building Abstractions with Structs
+% ============================================================================
+
+\chapter{Building Abstractions with Structs}
+
+\section{From Scalars to Records}
+
+Chapter~1 gave us bytes, addresses, and pointers, and Chapter~2
+opened the registers that hold them while the machine runs. With only
+scalar
+types (\code{int}, \code{char}, \code{double}) we can already do real
+work, but real systems are full of \emph{aggregates}: a connection has
+a socket, a buffer, a state, a timeout; a record has a key and a
+value; a node has data and links to its neighbors. In C, the
+\emph{struct} is the tool that groups related data into one object
+whose bytes live contiguously in memory.
+
+A struct is a \emph{layout contract}: it tells the compiler exactly how
+to arrange a set of fields one after another in memory, so that the
+whole group can be passed around, pointed at, and stored as a single
+unit. Everything else in this book---linked lists, hash tables, trees,
+graphs, sockets---is, at bottom, structs pointing at other structs.
+
+\section{Declaring and Using a Struct}
+
+\begin{lstlisting}[caption={A minimal struct: a 2D point.}]
+#include <stdio.h>
+
+struct point {
+    int x;
+    int y;
+};
+
+int main(void) {
+    struct point origin;       /* the struct is a variable like any other */
+
+    origin.x = 0;              /* fields are accessed with the dot */
+    origin.y = 0;
+
+    printf("origin = (%d, %d)\n", origin.x, origin.y);
+    return 0;
+}
+\end{lstlisting}
+
+The declaration \code{struct point \{ int x; int y; \};} introduces a
+new type named \code{struct point}. It does \emph{not} allocate any
+memory; it merely describes the shape. Only when we declare a variable
+of that type---\code{struct point origin;}---does the compiler reserve
+the bytes. The memory reserved is exactly the sum of the field sizes,
+plus whatever padding alignment requires, as we are about to see.
+
+\subsection{typedef: Giving the Struct a Short Name}
+
+Writing \code{struct point} everywhere is verbose, and in this book we
+will write a great many struct types. \code{typedef} introduces an
+alias for an existing type, so we can say \code{point} and mean
+\code{struct point}. From here on we will declare our structs with a
+\code{typedef} and refer to them by the bare name.
+
+\begin{lstlisting}[caption={A typedef names the struct; a companion pointer typedef follows.}]
+#include <stdio.h>
+
+typedef struct point {
+    int x;
+    int y;
+} point;
+
+typedef struct node {
+    int          value;
+    struct node *next;   /* inside the definition we still use "struct node" */
+} node;
+
+int main(void) {
+    point origin;        /* "point" is an alias for "struct point" */
+
+    origin.x = 0;
+    origin.y = 0;
+
+    printf("(%d, %d)\n", origin.x, origin.y);
+    return 0;
+}
+\end{lstlisting}
+
+Two notes on discipline. First, the tag name \code{point} in
+\code{typedef struct point \{...\} point;} is optional but useful for
+self-documentation. Second, \code{typedef} does \emph{not} create a
+new type; it creates an alias. The rules of argument passing, copying,
+and layout apply to the alias exactly as they do to the original. And a
+pointer typedef, \code{typedef struct node *node\_ptr;}, is a style
+choice many codebases make; we avoid it in this course, because
+hiding a pointer inside a typedef makes it easy to forget whether you
+hold a pointer or a value. Pointers stay explicit.
+
+\section{Memory Layout of a Struct}
+
+Because a struct's fields are laid out in declaration order, we can
+draw the layout of \code{struct point} with perfect precision:
+
+\begin{verbatim}
+   struct point { int x; int y; }   -- size 8 bytes
+
+   offset:  0     1     2     3     4     5     6     7
+           +-----+-----+-----+-----+-----+-----+-----+-----+
+           |           x           |           y           |
+           +-----+-----+-----+-----+-----+-----+-----+-----+
+            ^                       ^
+            address of origin       address of origin.y
+            == address of origin.x
+\end{verbatim}
+
+The address of a struct is the address of its first field. The two are
+the same number, which is exactly why \code{\&origin.x} and
+\code{\&origin} compare equal. Every later field sits at a fixed
+\emph{offset} from the start of the struct.
+
+\begin{lstlisting}[caption={A struct is an int and another int, one after another.}]
+#include <stdio.h>
+
+struct point {
+    int x;
+    int y;
+};
+
+int main(void) {
+    struct point origin;
+
+    origin.x = 10;
+    origin.y = 20;
+
+    printf("sizeof(struct point) = %zu\n", sizeof(struct point));
+    printf("&origin      = %p\n", (void *) &origin);
+    printf("&origin.x    = %p\n", (void *) &origin.x);
+    printf("&origin.y    = %p\n", (void *) &origin.y);
+    printf("offset of y  = %ld\n",
+           (long) ((char *) &origin.y - (char *) &origin.x));
+
+    return 0;
+}
+\end{lstlisting}
+
+We printed the offset by subtracting two \code{char*} pointers. Pointer
+subtraction between two pointers into the same array of \code{char}
+yields the number of \code{char} elements between them, which is the
+offset in bytes. This is a legitimate, explicit technique; note that we
+cast to \code{char*} precisely so that the arithmetic counts bytes and
+not elements.
+
+\section{Data Alignment: Why the CPU Demands It}
+
+Here is the fact about modern hardware that explains everything that
+looks ``wasteful'' about structs: a CPU reads memory in aligned units.
+On x86-64, a 4-byte \code{int} is best placed at an address divisible
+by 4; an 8-byte \code{double} at an address divisible by 8. When a
+multi-byte object straddles a boundary, the hardware may need two
+fetches instead of one, or---on stricter architectures such as some
+RISC designs---may raise a fault outright.
+
+\begin{verbatim}
+   Correctly aligned (good):
+
+   address: 1000  1001  1002  1003  1004  1005  1006  1007
+           +-----+-----+-----+-----+-----+-----+-----+-----+
+           |           an int at 1000         |  (next obj) |
+           +-----+-----+-----+-----+-----+-----+-----+-----+
+            ^ int starts at a multiple of 4
+
+   Misaligned (bad):
+
+   address: 1002  1003  1004  1005  1006  1007  1008  1009
+           +-----+-----+-----+-----+-----+-----+-----+-----+
+           | (prev) |      an int starting at 1002      |   |
+           +-----+-----+-----+-----+-----+-----+-----+-----+
+            ^ 1002 is not a multiple of 4: the int straddles a
+              boundary and may need two fetches to be read.
+\end{verbatim}
+
+To honor alignment, the compiler may insert \emph{padding} bytes
+between struct fields. These bytes exist, are addressable, and are
+completely invisible to you unless you look at the layout directly.
+They cost memory but buy speed and, on many machines, correctness.
+
+\begin{ruleofthumb}[Never assume a field's offset]
+The C standard guarantees fields are laid out in declaration order, but
+\emph{not} their exact offsets, because padding depends on the machine
+and the compiler. Any code that assumes \code{int} sits at offset 0, or
+that a struct is exactly the sum of its parts, is broken by definition.
+Use \code{sizeof} and \code{offsetof} if you must know the numbers.
+\end{ruleofthumb}
+
+\section{Padding: The Hidden Bytes}
+
+Consider a structure whose fields have different alignments:
+
+\begin{lstlisting}[caption={A struct with mixed field sizes.}]
+struct entry {
+    char   tag;     /* 1 byte,  alignment 1 */
+    int    count;   /* 4 bytes, alignment 4 */
+    short  level;   /* 2 bytes, alignment 2 */
+};
+\end{lstlisting}
+
+The compiler must place each field at an offset divisible by its own
+alignment. The resulting layout, with padding marked \code{//}:
+
+\begin{verbatim}
+   struct entry -- size 12, with 5 padding bytes hidden inside
+
+   offset:  0     1     2     3     4     5     6     7
+           +-----+-----+-----+-----+-----+-----+-----+-----+
+           | tag | //  | //  | //  |        count         |
+           +-----+-----+-----+-----+-----+-----+-----+-----+
+   offset:  8     9    10    11
+           +-----+-----+-----+-----+
+           | level |     //    | // |
+           +-----+-----+-----+-----+
+
+   - tag    at offset 0  (alignment 1: any address)
+   - count  at offset 4  (must be a multiple of 4; bytes 1-3 are padding)
+   - level  at offset 8  (must be a multiple of 2)
+   - total raw payload:  1 + 4 + 2 = 7 bytes
+   - struct size: 12     (rounded up to a multiple of 4, the largest
+                           alignment in the struct, so that arrays of
+                           these structs stay aligned)
+\end{verbatim}
+
+The struct ended up at 12 bytes for 7 bytes of real data. Five of the
+twelve bytes are silent. This is not a bug; it is the machine telling
+you how it wants to be spoken to. But notice the waste is not forced:
+nothing about the fields themselves demands that layout. If we
+redeclare the fields in the right order, the compiler can satisfy every
+alignment without a single padding byte between fields.
+
+\section{Field Ordering to Shrink Structs}
+
+Place fields in decreasing order of their alignment. The largest
+alignment dominates; once the big fields are placed, the small ones
+slot into the gaps.
+
+\begin{lstlisting}[caption={The same data, reordered.}]
+struct entry {
+    int    count;   /* 4 bytes, alignment 4 */
+    short  level;   /* 2 bytes, alignment 2 */
+    char   tag;     /* 1 byte,  alignment 1 */
+};
+\end{lstlisting}
+
+\begin{verbatim}
+   struct entry, reordered -- size 8
+
+   offset:  0     1     2     3     4     5     6     7
+           +-----+-----+-----+-----+-----+-----+-----+-----+
+           |        count         | level | tag | //  |
+           +-----+-----+-----+-----+-----+-----+-----+-----+
+
+   - count  at offset 0
+   - level  at offset 4
+   - tag    at offset 6
+   - one padding byte at offset 7 (to round the size up to 8)
+   - raw payload still 7 bytes, but the struct is now 8, not 12.
+\end{verbatim}
+
+The same information shrank from 12 bytes to 8 bytes, a third smaller,
+for free. In a table of a million entries that is 4~MB saved, and on a
+cache-bound hot path it is substantially more than a memory saving.
+Field ordering is the cheapest optimization in C and one that beginners
+never think about.
+
+\begin{insight}[The struct is a memory-layout contract, not just a type]
+Reading a struct definition is reading a memory diagram. Before you
+write a struct for a hot path or a wire format, order its fields from
+largest alignment to smallest, and get into the habit of sketching the
+layout by hand. The machine will reward you.
+\end{insight}
+
+\section{offsetof and sizeof}
+
+C gives us two operators for interrogating layouts at compile time.
+\code{sizeof(type)} returns the total size including trailing padding;
+\code{offsetof(type, field)} returns the byte offset of a field.
+
+\begin{lstlisting}[caption={Reading the layout without guessing.}]
+#include <stdio.h>
+#include <stddef.h>
+
+struct entry {
+    int    count;
+    short  level;
+    char   tag;
+};
+
+int main(void) {
+    printf("sizeof(struct entry)      = %zu\n", sizeof(struct entry));
+    printf("offsetof count            = %zu\n", offsetof(struct entry, count));
+    printf("offsetof level            = %zu\n", offsetof(struct entry, level));
+    printf("offsetof tag              = %zu\n", offsetof(struct entry, tag));
+    return 0;
+}
+\end{lstlisting}
+
+\code{offsetof} is what lets a generic serializer walk a struct without
+special-casing each field: given a pointer to the struct, the address
+of a field is simply
+\code{(char *) base + offsetof(struct entry, level)}. We will use
+exactly this idea when we build a data serialization layer in the
+chapters on file I/O and networking.
+
+\begin{ruleofthumb}[Arrays of structs inherit the alignment]
+The compiler rounds a struct's size up to a multiple of its strictest
+member so that an array of such structs has every element aligned. That
+trailing padding is why \code{sizeof} can exceed the sum of the
+\code{offsetof} values plus the last field's size. Treat
+\code{sizeof(struct)} as authoritative; never compute it by hand.
+\end{ruleofthumb}
+
+\section{Structs and Pointers: The Arrow Operator}
+
+Pointers to structs are everywhere, because structs are the units we
+link together. To reach a field through a pointer, C offers the
+\emph{arrow operator}: \code{p->field} means \code{(*p).field}.
+
+\begin{lstlisting}[caption={Accessing fields through a pointer.}]
+#include <stdio.h>
+
+struct point {
+    int x;
+    int y;
+};
+
+/* Move the point that p points at by (dx, dy). */
+void translate(struct point *p, int dx, int dy) {
+    p->x = p->x + dx;   /* equivalent to (*p).x = (*p).x + dx; */
+    p->y = p->y + dy;
+}
+
+int main(void) {
+    struct point here;
+    struct point *cursor;
+
+    here.x = 3;
+    here.y = 4;
+
+    cursor = &here;               /* cursor now points at here */
+    translate(cursor, 5, 6);      /* here becomes (8, 10)     */
+
+    printf("here = (%d, %d)\n", here.x, here.y);
+    printf("via pointer = (%d, %d)\n", cursor->x, cursor->y);
+    return 0;
+}
+\end{lstlisting}
+
+\begin{verbatim}
+   Memory state after cursor = &here:
+
+        +--------------------+
+        |      here          |
+        |  x = 3  y = 4      |
+        +--------------------+
+            ^
+            |
+        cursor  (a struct point* holding &here)
+\end{verbatim}
+
+Why pointers instead of passing the struct by value? A pointer passes 8
+bytes no matter how large the struct is; copying a big struct by value
+copies every byte. More importantly, a function that receives a pointer
+can \emph{modify} the caller's struct, exactly as \code{translate} did
+above. If you want a function to change a struct, pass its address.
+
+\section{const Correctness with Structs}
+
+\code{const} is the compiler's way of recording your intent, and in
+struct-heavy code it earns its keep. The keyword has two different
+places to attach: to the pointed-to struct (\code{const struct person
+*p}, read-only object) or to the pointer itself (\code{struct person
+*const p}, a pointer that cannot be reassigned). The first is the one
+we use constantly in function signatures.
+
+\begin{lstlisting}[caption={const expresses ``read-only'' on function boundaries.}]
+#include <stdio.h>
+
+typedef struct point {
+    int x;
+    int y;
+} point;
+
+/* "p" points at a struct the caller promises not to modify through us. */
+int distance_squared(const point *p) {
+    return p->x * p->x + p->y * p->y;
+}
+
+/* The pointer itself is const: inside this function, q cannot be reassigned. */
+void print_point(point *const q) {
+    printf("(%d, %d)\n", q->x, q->y);
+}
+
+int main(void) {
+    point origin = {0, 0};
+
+    print_point(&origin);
+    printf("dist^2 = %d\n", distance_squared(&origin));
+    return 0;
+}
+\end{lstlisting}
+
+Read the signatures as promises. \code{distance\_squared} promises it
+will not modify the point; a caller can therefore hand it any point,
+confident nothing is corrupted. \code{const} does not make memory
+physically read-only---it is a compile-time contract, and a
+\code{const} pointer to a struct is still an ordinary 8-byte address.
+But the contract is enforced: writing through a \code{const} pointer is
+a compile error, which turns a whole class of lifetime and aliasing
+bugs into loud, immediate failures at build time.
+
+\begin{ruleofthumb}[Declare read-only parameters const]
+Any function that receives a pointer to a struct and does not modify
+it should declare that parameter \code{const}. It costs nothing, it
+documents the interface, and it lets the compiler catch accidental
+writes. In Chapter~4 every ``print'' and ``lookup'' function takes
+\code{const} pointers; every ``insert'' and ``remove'' does not.
+\end{ruleofthumb}
+
+\section{Structs on the Heap}
+
+So far our structs have lived on the stack. But the stack frame dies
+with the function, so any struct that must outlive its creator, or
+whose count is known only at runtime, is allocated on the heap with
+\code{malloc}. This is the moment when structs and pointers become
+genuinely powerful: \code{malloc} returns the address of a fresh,
+uninitialized region big enough for the struct, and we then fill its
+fields through that address.
+
+\begin{lstlisting}[caption={A struct living on the heap, with ownership handled.}]
+#include <stdio.h>
+#include <stdlib.h>
+
+struct account {
+    int   id;
+    long  balance;
+};
+
+struct account *account_new(int id) {
+    struct account *a;
+
+    a = malloc(sizeof(struct account));   /* ask for exactly one struct */
+    if (a == NULL) {
+        return NULL;
+    }
+
+    a->id = id;
+    a->balance = 0;
+
+    return a;
+}
+
+int main(void) {
+    struct account *acc;
+
+    acc = account_new(7);
+    if (acc == NULL) {
+        fprintf(stderr, "allocation failed\n");
+        exit(1);
+    }
+
+    printf("account %d has balance %ld\n", acc->id, acc->balance);
+
+    free(acc);       /* we own it, so we free it; no more acc->id after this */
+    return 0;
+}
+\end{lstlisting}
+
+Three details deserve emphasis, because they are the core discipline of
+every data structure we build in this book:
+
+\begin{itemize}
+  \item \code{malloc(sizeof(struct account))} asks for exactly the
+    struct's size---padding included---so the layout contract carries
+    over to the heap without us ever computing byte counts.
+  \item The \code{if (a == NULL)} check is the contract of every
+    allocation. Heap exhaustion is a real, reportable outcome.
+  \item Ownership is explicit: \code{account\_new} allocates, and the
+    caller frees. If \code{acc} is later embedded in a linked list or a
+    hash table, the data structure becomes the owner, and it is the
+    data structure's \emph{destroy} function that frees it.
+\end{itemize}
+
+\section{Nested Structs}
+
+A struct may contain another struct \emph{by value}. The inner struct's
+bytes are laid out inline, within the outer struct, at the offset its
+alignment requires. The memory diagram makes the word ``nested'' literal:
+
+\begin{lstlisting}[caption={A struct containing a struct.}]
+#include <stdio.h>
+
+typedef struct point {
+    int x;
+    int y;
+} point;
+
+typedef struct rect {
+    point  top_left;     /* a whole point, embedded */
+    point  bottom_right; /* another whole point, embedded */
+} rect;
+\end{lstlisting}
+
+\begin{verbatim}
+   struct rect -- size 16
+
+   offset:  0     1     2     3     4     5     6     7
+           +-----+-----+-----+-----+-----+-----+-----+-----+
+           |      top_left.x       |      top_left.y       |
+           +-----+-----+-----+-----+-----+-----+-----+-----+
+   offset:  8     9    10    11    12    13    14    15
+           +-----+-----+-----+-----+-----+-----+-----+-----+
+           |   bottom_right.x     |   bottom_right.y       |
+           +-----+-----+-----+-----+-----+-----+-----+-----+
+
+   top_left   occupies bytes 0..7
+   bottom_right occupies bytes 8..15
+\end{verbatim}
+
+Access uses the dot twice: \code{box.top\_left.x}. There is no arrow
+involved unless you reach the nested field through a pointer to the
+outer struct, in which case it is \code{box->top\_left.y}. The nested
+struct has no separate identity; it is a set of fields at fixed offsets
+inside its parent. This is how we build hierarchy from flat memory.
+
+\section{Flexible Array Members: The Variable-Length Tail}
+
+C99 introduced the \emph{flexible array member}: a struct whose last
+field is an unsized array \code{data[]}. The struct itself occupies
+only the fixed fields; the array bytes are tacked on at the end by
+whichever allocation you make. This is exactly how real kernels and
+libraries carry a length plus a payload in one allocation, and it is
+the pattern behind messages, packets, and buffers throughout this book.
+
+\begin{lstlisting}[caption={One allocation holds header and payload together.}]
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct message {
+    unsigned int len;      /* number of valid bytes in data */
+    char data[];           /* flexible array member: no size here */
+} message;
+
+int main(void) {
+    message *msg;
+    size_t payload;
+
+    payload = 5;                        /* we want to carry 5 bytes */
+    msg = malloc(sizeof(message) + payload);
+    if (msg == NULL) {
+        exit(1);
+    }
+
+    msg->len = payload;
+    memcpy(msg->data, "hello", payload);
+
+    printf("message: len=%u data=%.*s\n", msg->len, (int) msg->len, msg->data);
+
+    free(msg);                          /* one allocation, one free */
+    return 0;
+}
+\end{lstlisting}
+
+\begin{verbatim}
+   The allocation from malloc(sizeof(message) + 5):
+
+   +----------------+------------------------------+
+   |   len  (4B)    |   data[0..4]  ("hello")      |
+   +----------------+------------------------------+
+   ^  sizeof(message) = 4            ^  exactly payload bytes
+
+   The whole thing is ONE contiguous allocation, freed with one free().
+   No pointer chase, no leak, no fragmentation from a second malloc.
+\end{verbatim}
+
+The rules are strict: the flexible array must be the last member, there
+must be at least one named member before it, and you cannot
+\emph{store} an array of these structs---you must allocate each one
+individually, because its size is not fixed at compile time. Used
+honestly, it removes an entire class of double-allocation and
+free-order bugs from protocols, virtual machines, and caches.
+
+\section{Self-Referential Structures}
+
+A struct may contain a pointer to an object of its own type. The type
+is incomplete during its own definition, but a \emph{pointer} to it is
+always allowed, because a pointer is a fixed-size address regardless of
+what it targets. This one trick---structs pointing at themselves---is
+the seed from which linked lists, trees, and graphs all grow.
+
+\begin{lstlisting}[caption={The birth of every linked structure.}]
+struct node {
+    int value;
+    struct node *next;   /* pointer to another node, or NULL */
+};
+\end{lstlisting}
+
+\begin{verbatim}
+   Three nodes linked into a chain:
+
+   head
+    |
+    v
+   +---------+      +---------+      +---------+
+   | value=10|      | value=20|      | value=30|
+   | next ---|----->| next ---|----->| next ---|-----> NULL
+   +---------+      +---------+      +---------+
+      ^                 ^                 ^
+      node A            node B            node C
+      (heap)            (heap)            (heap)
+
+   Each box is a struct node. The last "next" points at NULL, marking
+   the end of the chain. The whole list is named by the single pointer
+   "head".
+\end{verbatim}
+
+The list is a web of arrows, exactly the diagrams we drew in
+Chapter~1. A linked list is not a special language feature; it is a
+pointer stored inside a struct pointing at another instance of that
+struct. That realization, once felt, unlocks every container in the
+standard toolbox.
+
+\section{Copying and Returning Structs}
+
+Unlike arrays, structs can be copied and returned by value. The
+compiler copies the whole layout, padding included. A struct returned
+by value is a complete, independent object.
+
+\begin{lstlisting}[caption={Structs copy and return by value; arrays do not.}]
+#include <stdio.h>
+
+struct point {
+    int x;
+    int y;
+};
+
+struct point make_point(int x, int y) {
+    struct point p;
+
+    p.x = x;
+    p.y = y;
+    return p;          /* a copy of p is handed back; safe, p is local */
+}
+
+int main(void) {
+    struct point a = make_point(2, 3);
+    struct point b;
+
+    b = a;             /* b is now an independent copy of a */
+    b.x = 100;
+
+    printf("a = (%d, %d)\n", a.x, a.y);   /* still (2, 3) */
+    printf("b = (%d, %d)\n", b.x, b.y);   /* (100, 3)    */
+    return 0;
+}
+\end{lstlisting}
+
+Returning a \emph{struct} by value is safe; returning a pointer to a
+local struct is the dangling-pointer bug of Chapter~1. The rule of
+thumb: small structs (a few words) are fine by value; large ones are
+cheaper as pointers, but then you own the lifetime problem that comes
+with the heap.
+
+\begin{insight}[Shallow vs.\ deep copy]
+\code{b = a} copies the struct's bytes verbatim. If the struct contains
+a pointer (like our \code{node} above), the \emph{pointer} is copied,
+not the node it points at: \code{b.next} and \code{a.next} name the
+same memory. That is a shallow copy, and it is usually what we want in
+containers. Deep copying---duplicating everything reachable through
+pointers---is a deliberate, manual operation we will write by hand when
+we build graphs in Chapter~4.
+\end{insight}
+
+\section{Array of Structs vs.\ Struct of Arrays}
+
+When you hold many records, there are two ways to arrange them in
+memory, and the choice is a measurable performance decision that
+systems programmers make on every hot path.
+
+\textbf{Array of Structs} (AoS) interleaves the fields: element 0's all
+fields, then element 1's all fields. \textbf{Struct of Arrays} (SoA)
+groups like fields together: all \code{x} values, then all \code{y}
+values.
+
+\begin{verbatim}
+   Array of Structs (AoS):              Struct of Arrays (SoA):
+
+   point points[4];                     struct points {
+                                            int xs[4];
+       [x0 y0 x1 y1 x2 y2 x3 y3]            int ys[4];
+                                        };
+
+   each element is contiguous:          all xs live together:
+   points[i].x and points[i].y         points.xs[i]
+   are adjacent bytes                  points.ys[i] are far apart
+
+   good when you touch both x and y     good when a pass touches only x
+   together (all fields of a record)    (a single field across records)
+\end{verbatim}
+
+The modern memory hierarchy makes this matter. The CPU loads memory in
+cache lines (typically 64 bytes). AoS is ideal when each record is used
+wholesale---the whole record arrives in one line. SoA is ideal when an
+algorithm scans one field of every record, because consecutive accesses
+land in consecutive addresses, and the fields you never touch are never
+pulled into cache. Scientific code, game engines, and database column
+stores all exploit SoA.
+
+\begin{insight}[Which layout does your access pattern want?]
+Ask: do my loops walk \emph{records} or \emph{fields}? Walking records
+wants AoS; walking one field at a time wants SoA. There is no
+universal winner, and getting this right is often worth more than any
+micro-optimization inside a loop.
+\end{insight}
+
+\section{Bit Fields: Squeezing Flags into Bytes}
+
+For control registers, file formats, and network headers, C offers
+\emph{bit fields}: members whose width is specified in bits. The layout
+of bit fields is implementation-defined in painful detail, so we treat
+them as a specialized tool, not a general one. They are invaluable
+when a hardware or protocol spec forces bits to be packed.
+
+\begin{lstlisting}[caption={Bit fields: several flags in one storage unit.}]
+#include <stdio.h>
+
+struct flags {
+    unsigned int valid  : 1;   /* one bit  */
+    unsigned int dirty  : 1;   /* one bit  */
+    unsigned int kind   : 3;   /* three bits (0..7) */
+};
+
+int main(void) {
+    struct flags f;
+
+    f.valid = 1;
+    f.dirty = 0;
+    f.kind  = 5;
+
+    printf("valid=%u dirty=%u kind=%u\n", f.valid, f.dirty, f.kind);
+    return 0;
+}
+\end{lstlisting}
+
+Notice we declared them \code{unsigned int}. A signed one-bit field can
+only hold $-1$ or $0$, which is almost never what anyone means.
+
+\begin{ruleofthumb}[Bit fields are for hardware and wire formats]
+If your struct is destined for a control register or a protocol header
+whose bit layout is dictated by a spec, bit fields are the right tool.
+If your struct merely wants ``small flags'', prefer ordinary
+\code{int} fields (or bitwise \code{\&} / \code{|} on a single
+integer); the exact layout of bit fields across compilers is not
+portable, and portability is a promise we keep in this course.
+\end{ruleofthumb}
+
+\section{Unions: Overlapping Storage}
+
+A \code{union} is a struct whose members all occupy the \emph{same}
+bytes. Its size is the size of its largest member, not the sum. Writing
+one member overwrites the others, so a union is only as meaningful as
+the convention that says which member is live. Pair a union with a
+``kind'' tag and you have a \emph{tagged union}, the C ancestor of the
+enum variant that powers trees, graphs, and protocol parsers everywhere.
+
+That tag is an \code{enum}---short for \emph{enumeration}, a type that
+names a set of integer constants. \code{enum kind \{ KIND\_INT,
+KIND\_DOUBLE, KIND\_TEXT \};} declares three constants
+(\code{KIND\_INT} is 0, the next 1, the next 2, unless you say
+otherwise) and a type \code{kind} that holds one of them. It exists so
+your code can say \code{v.tag = KIND\_INT} instead of the
+incomprehensible \code{v.tag = 0}. In C an enum is just a set of named
+integer constants, so the compiler does not police which values you
+assign or compare---the names exist for humans, not for enforcement.
+This is the C version of a named choice, and you will see it in every
+parser and protocol handler later in the book.
+
+\begin{verbatim}
+   struct or union?  Same members, very different size.
+
+   struct thing {                   union thing {
+       int n;      // 4 bytes            int n;      // 4 bytes
+       double d;   // 8 bytes            double d;   // 8 bytes
+       char c[16]; // 16 bytes           char c[16]; // 16 bytes
+   };               // 32 bytes       };              // 16 bytes
+
+   A struct keeps every member:               A union reuses the space:
+   +----+----+----+----+----+----+----+      +----+----+----+----+----+
+   | n  | pad |      d      |    c[16]   |   |   n, or d, or c[16]    |
+   +----+----+----+----+----+----+----+----+  +----+----+----+----+----+
+   0    4   8                16     32        0                        16
+\end{verbatim}
+
+The standard trick is to record \emph{which} member is live in a
+sibling field, and to treat writes to the union as a single operation.
+
+\begin{lstlisting}[caption={A tagged union: kind says which member is live.}]
+#include <stdio.h>
+
+typedef enum kind {
+    KIND_INT,
+    KIND_DOUBLE,
+    KIND_TEXT
+} kind;
+
+typedef struct value {
+    kind tag;              /* which member of u is valid */
+    union {
+        int    as_int;
+        double as_double;
+        char   as_text[16];
+    } u;
+} value;
+
+void value_print(const value *v) {
+    /* We promise to read only the member named by v->tag. */
+    if (v->tag == KIND_INT) {
+        printf("%d\n", v->u.as_int);
+    } else if (v->tag == KIND_DOUBLE) {
+        printf("%f\n", v->u.as_double);
+    } else {
+        printf("%s\n", v->u.as_text);
+    }
+}
+
+int main(void) {
+    value v;
+
+    v.tag = KIND_INT;
+    v.u.as_int = 42;
+    value_print(&v);
+
+    v.tag = KIND_TEXT;
+    v.u.as_text[0] = 'h';
+    v.u.as_text[1] = 'i';
+    v.u.as_text[2] = '\0';
+    value_print(&v);
+
+    return 0;
+}
+\end{lstlisting}
+
+The danger is symmetrical and classic: read the wrong member and you
+interpret one kind of bits as another, silently producing garbage
+numbers or strings. The tag discipline is the price of memory sharing.
+Used with discipline, tagged unions give us a single \code{value} type
+for the key/value engines, expression trees, and configuration parsers
+we build in later chapters.
+
+\section{Practical Exercise: A Person Registry}
+
+Let us assemble the chapter into a working registry: a linked list of
+\code{struct person} records, built entirely with the techniques we
+have seen. This is the skeleton on which the serious containers of
+Chapter~4 will be built, so read its shape carefully: constructor,
+push-front, traversal, destroy.
+
+\begin{lstlisting}[caption={registry.c: a minimal linked list of persons.}]
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+struct person {
+    char name[32];
+    int  age;
+    struct person *next;      /* the link to the following person, or NULL */
+};
+
+/* Create a new person on the heap. Returns NULL on failure. */
+struct person *person_new(const char *name, int age) {
+    struct person *p;
+
+    p = malloc(sizeof(struct person));
+    if (p == NULL) {
+        return NULL;
+    }
+
+    strncpy(p->name, name, sizeof(p->name) - 1);
+    p->name[sizeof(p->name) - 1] = '\0';
+    p->age = age;
+    p->next = NULL;
+
+    return p;
+}
+
+/* Insert p at the front of the list named by *head. */
+void list_push_front(struct person **head, struct person *p) {
+    p->next = *head;          /* p points at whatever was first before  */
+    *head = p;                /* and *head now names p as the new first */
+}
+
+/* Print every person in the list. */
+void list_print_all(const struct person *head) {
+    const struct person *cur;
+
+    cur = head;
+    while (cur != NULL) {
+        printf("%s, age %d\n", cur->name, cur->age);
+        cur = cur->next;      /* advance to the next node */
+    }
+}
+
+/* Free every node in the list. */
+void list_free_all(struct person *head) {
+    struct person *cur;
+    struct person *next;
+
+    cur = head;
+    while (cur != NULL) {
+        next = cur->next;     /* remember the successor before freeing  */
+        free(cur);            /* free this node                          */
+        cur = next;           /* move on                                */
+    }
+}
+
+int main(void) {
+    struct person *head = NULL;
+
+    list_push_front(&head, person_new("ada", 36));
+    list_push_front(&head, person_new("linus", 55));
+    list_push_front(&head, person_new("ken", 81));
+
+    list_print_all(head);
+
+    list_free_all(head);
+    head = NULL;   /* head is now dangling; clearing it is good hygiene */
+
+    return 0;
+}
+\end{lstlisting}
+
+Study \code{list\_push\_front} closely. It takes \code{struct person
+**head} because it must \emph{rewrite} the caller's \code{head}
+variable---the exact pointer-to-pointer pattern from Chapter~1.
+And \code{list\_free\_all} saves \code{next} \emph{before} calling
+\code{free}, because after \code{free(cur)} the node is gone and
+reading \code{cur->next} would be a use-after-free. Every line here
+exists to keep the arrows honest.
+
+\section{Structures in Bytes}
+
+The layouts you computed by hand earlier in this chapter, collected on
+one page. On a 64-bit machine with 4-byte \code{int} and 8-byte
+\code{double}:
+
+\begin{verbatim}
+   struct point { int x; int y; }        size  8   x:0  y:4
+   struct entry (tag, count, level)      size 12   tag:0 count:4 level:8
+   struct entry (count, level, tag)      size  8   count:0 level:4 tag:6
+   struct rect  { point tl; point br; }  size 16   tl:0  br:8
+   union thing  { int n; double d; char c[16]; }   size 16
+   struct flags (three bit fields)       size  4   one storage unit
+   struct message { uint len; char data[]; }       size  4  (FAM adds nothing)
+
+   "field:off" is the byte offset a debugger reports; size is what
+   sizeof() returns. Both come from the alignment rules, never from
+   hand arithmetic.
+\end{verbatim}
+
+The three rules in byte terms: every field starts at a byte offset
+divisible by its own alignment; the struct's size rounds up to a
+multiple of its strictest member's alignment; and a union occupies
+exactly its largest member. Bit fields are the exception to ``every
+field has an address''---a 1-bit field has no byte address, only a bit
+position inside its storage unit. And \code{offsetof(struct entry,
+level)} being 8 while \code{sizeof(struct entry)} is 12 is the
+padding: 4 bytes the compiler reserved for you. Those padding bytes
+are exactly why Chapter~16 will refuse to \code{fwrite} a struct to
+disk and will write a wire format instead.
+
+\section{Summary}
+
+We now possess the two great tools of C: addresses/pointers
+(Chapter~1) and structured, contiguous records (this chapter). The
+combination---structs that point at each other---is the raw material of
+every data structure that follows.
+
+\begin{verbatim}
+   The toolbox so far:
+
+   +--------------------------+-----------------------------------------+
+   | idea                     | the tool                                |
+   +--------------------------+-----------------------------------------+
+   | an address               | pointer: int *p;                        |
+   | a grouped record         | struct point { int x; int y; };         |
+   | a short alias for a type | typedef struct point {...} point;       |
+   | record on the heap       | malloc(sizeof(point));                  |
+   | field through ptr        | p->x                                    |
+   | read-only contract       | const point *p                          |
+   | a struct inside a struct | point top_left;  (nested by value)      |
+   | a chain of records       | struct node { ...; struct node *next; } |
+   | header + payload         | char data[];   (flexible array member)  |
+   | silent extra bytes       | alignment padding (order fields!)       |
+   | one storage, many views  | union { ... }  + a tag                  |
+   | rows or columns          | AoS vs SoA (choose by access pattern)   |
+   +--------------------------+-----------------------------------------+
+\end{verbatim}
+
+In Chapter~4 we go to work. The Mega Chapter builds and dissects the
+entire menagerie---linked lists in every flavor, skip lists, hash
+tables, trees from $N$-ary to B+ trees, and graphs with edges and
+weights---each one drawn with memory diagrams and implemented in this
+explicit, pointer-honest style.

@@ -1,0 +1,901 @@
+% ============================================================================
+%  chapter7.tex
+%  Inter-Process Communication: Pipes and the Art of Wiring Processes
+% ============================================================================
+
+\chapter{Inter-Process Communication: Pipes}
+
+\section{Why Processes Cannot Just Talk}
+
+Chapter~5 gave each process a \emph{private} address space and told you
+the kernel forbids one process from poking another's memory. That
+isolation is the price of safety. But isolation would be useless if
+processes could not cooperate. A compiler must feed its output to an
+assembler; a web server must hand a request to a worker; a database
+must talk to its replicas. The general problem is called
+\emph{inter-process communication} (IPC): \emph{how do two independent
+processes exchange data when they cannot touch each other's memory?}
+
+\begin{verbatim}
+   What processes CANNOT do:            What the OS provides instead:
+
+   Process A reads Process B's heap.    channels that cross the kernel:
+        A -X-> B                         pipes, files, shared memory,
+                                         sockets, signals (ch.6)
+
+   Both point at "the same" variable.   The OS copies bytes across the
+   No shared addresses exist.            boundary; the kernel does the
+                                         moving.
+\end{verbatim}
+
+There are five classic IPC mechanisms, each a different trade-off, and
+we will meet them all by the end of the book. This chapter builds the
+first and most elegant one---the \emph{pipe}---because it is the
+simplest possible answer and because it is the mechanism hiding behind
+every command line you have ever piped.
+
+\begin{osconcept}
+IPC is an operating system problem for a reason that flows directly
+from Chapter~5: processes are isolated by the kernel, so only the
+kernel can connect them. A channel must be a kernel object---something
+both processes name through descriptors---because the kernel is the
+only party both can trust and the only party with the power to move
+bytes between private address spaces. IPC is the deliberate exception
+to the isolation rule, and the OS decides exactly which exceptions are
+allowed.
+\end{osconcept}
+
+\section{What a Pipe Is}
+
+A \emph{pipe} is a unidirectional byte stream connecting two endpoints.
+You create one with \code{pipe()}, which gives you a pair of
+descriptors: \code{pfd[0]} is the \emph{read end}, \code{pfd[1]} is
+the \emph{write end}. Bytes written to \code{pfd[1]} appear, in order,
+at \code{pfd[0]}.
+
+\begin{lstlisting}[caption={A pipe is two descriptors: read end and write end.}]
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+int main(void) {
+    int pfd[2];
+
+    if (pipe(pfd) < 0) {
+        perror("pipe");
+        exit(1);
+    }
+
+    printf("read end  = fd %d\n", pfd[0]);
+    printf("write end = fd %d\n", pfd[1]);
+
+    /* Write two bytes, then close the write end to signal EOF. */
+    write(pfd[1], "hi", 2);
+    close(pfd[1]);
+
+    {
+        char buf[8];
+        ssize_t got;
+
+        got = read(pfd[0], buf, sizeof(buf));
+        if (got < 0) {
+            perror("read");
+            exit(1);
+        }
+        printf("read %zd bytes: %.*s\n", got, (int) got, buf);
+    }
+
+    close(pfd[0]);
+    return 0;
+}
+\end{lstlisting}
+
+\begin{verbatim}
+   The pipe is not a file. It is a KERNEL buffer with two doors:
+
+        write end (fd[1])                read end (fd[0])
+             |                                ^
+             v                                |
+        +--------------------------------------------+
+        |  [ 'h' ][ 'i' ][ ][ ][ ][ ]  ...          |
+        |         the kernel's pipe buffer           |
+        +--------------------------------------------+
+
+   - "Byte stream" means there are NO message boundaries: whatever the
+     writer writes is a continuous sequence of bytes to the reader. If
+     you write "ab" and "cd", the reader may see "abcd", "abc"+"d", or
+     "a"+"bcd" depending on timing. Boundaries are NOT preserved.
+   - The pipe is UNIDIRECTIONAL: bytes flow only from write end to
+     read end. For two-way conversation you create two pipes.
+   - The bytes live in the KERNEL. The processes never share memory;
+     they only pass bytes across the syscall boundary.
+\end{verbatim}
+
+Two properties of this picture matter enormously. First, the pipe
+synchronizes the two sides \emph{automatically}: the kernel makes one
+side wait for the other. Second, the pipe has a finite capacity---on
+Linux, around 64 kilobytes---and that capacity, not the file system, is
+what makes blocking real.
+
+\begin{osconcept}
+A pipe is a kernel object: kernel memory for the buffer, kernel
+bookkeeping for the two endpoints, and kernel rules about when a
+process may proceed. Your program never sees the buffer; it sees two
+integers. This is the file-descriptor model of Chapter~5 applied to
+live data flow. Only the kernel can own the buffer, because only the
+kernel can mediate between two isolated address spaces without copying
+through either one's memory.
+\end{osconcept}
+
+\section{The Blocking Contract}
+
+Pipes are \emph{blocking}, and that is their superpower. The kernel
+makes the two ends wait for each other:
+
+\begin{verbatim}
+   EMPTY pipe:  read() blocks until bytes arrive.
+
+        write end                 read end
+             |                       v  (waiting...)
+        +------------------------------------+
+        |                                    |   <-- nothing to read
+        +------------------------------------+
+             (writer writes)
+        +------------------------------------+
+        | [ 'h' ][ 'i' ][ ][ ][ ][ ]        |
+        +------------------------------------+
+        read() wakes up and returns the bytes.
+
+   FULL pipe:   write() blocks until there is room.
+
+        +------------------------------------+
+        | [X][X][X][X][X][X][X][X]           |   <-- no room
+        +------------------------------------+
+             (reader reads)
+        +------------------------------------+
+        | [X][X][X][X][ ][ ][ ][ ]          |
+        +------------------------------------+
+        write() wakes up and deposits its bytes.
+\end{verbatim}
+
+This is worth slowing down for, because it is the whole point. The
+kernel is acting as a \emph{scheduler}: the reader does not busy-wait
+spinning the CPU; it goes to sleep and the kernel wakes it exactly when
+data is available. The writer sleeps when the buffer is full and wakes
+when the reader frees space. Neither process polls, and neither needs
+to know the other exists.
+
+\begin{verbatim}
+   The producer/consumer dance:
+
+   producer:                    consumer:
+     write(fd1, data, n);         got = read(fd0, buf, n);
+       |                              ^
+       |  if the pipe is full,        |  if the pipe is empty,
+       |  the kernel parks us         |  the kernel parks us
+       |  and wakes us later          |  and wakes us later
+       v                              |
+   bytes cross the kernel buffer, paced by whichever side is slower.
+\end{verbatim}
+
+The blocking contract is also where the classic \emph{deadlock} lives:
+if two processes each write into a pipe the other is supposed to read,
+and both pipes are full, each process sits blocked forever, each
+waiting for the other to make room. The kernel cannot rescue you; it
+only enforces the waiting.
+
+\begin{osconcept}
+Blocking I/O is the kernel's oldest concurrency solution. By parking a
+process that cannot make progress, the OS wastes no CPU and needs no
+coordination from the program; by waking it the instant it can proceed,
+the OS delivers an efficient rendezvous. Deciding when to sleep and
+when to wake---for every pipe, on every byte---is the scheduler's
+problem, and it is exactly why a pipe is an OS service rather than a
+library function.
+\end{osconcept}
+
+\section{fork + pipe: Wiring Two Processes Together}
+
+A pipe inside one process is a curiosity. The pipe becomes IPC the
+moment you \code{fork}: the child inherits a \emph{copy} of the
+descriptor table, so both processes hold the same two ends. One process
+keeps the write end, the other keeps the read end, and bytes flow
+between two independent address spaces.
+
+\begin{lstlisting}[caption={Parent writes, child reads: the canonical IPC dance.}]
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+
+int main(void) {
+    int pfd[2];
+    pid_t pid;
+
+    if (pipe(pfd) < 0) {
+        perror("pipe");
+        exit(1);
+    }
+
+    pid = fork();
+    if (pid < 0) {
+        perror("fork");
+        exit(1);
+    }
+
+    if (pid == 0) {
+        /* CHILD: keep the read end, drop the write end. */
+        char buf[64];
+        ssize_t got;
+
+        close(pfd[1]);
+
+        got = read(pfd[0], buf, sizeof(buf));
+        if (got < 0) {
+            perror("read");
+            exit(1);
+        }
+        printf("child read %zd bytes: %.*s\n", got, (int) got, buf);
+
+        close(pfd[0]);
+        exit(0);
+    }
+
+    /* PARENT: keep the write end, drop the read end. */
+    close(pfd[0]);
+
+    write(pfd[1], "hello from parent", 17);
+
+    close(pfd[1]);            /* closing the last write end sends EOF */
+
+    waitpid(pid, NULL, 0);
+    return 0;
+}
+\end{lstlisting}
+
+\begin{verbatim}
+   The state after fork, before each side closes its unused end:
+
+     parent                          child
+   +-------------+                 +-------------+
+   | fd table    |                 | fd table    |
+   | 0 stdin     |                 | 0 stdin     |
+   | 1 stdout    |                 | 1 stdout    |
+   | 2 stderr    |                 | 2 stderr    |
+   | 3 pfd[0] --+----------------->| 3 pfd[0]    |   read end
+   | 4 pfd[1] --+----------------->| 4 pfd[1]    |   write end
+   +-------------+                 +-------------+
+
+   The kernel pipe object is shared: it is reference-counted, like the
+   open file table. BOTH processes name it, so EITHER can read or write.
+
+   After each side closes its unused end, the roles are clean:
+
+     parent: [write end] =============> [read end]: child
+                 \ byte stream flows through the kernel /
+\end{verbatim}
+
+The discipline here is absolute and it is the number-one pipe bug in
+all of systems programming: \emph{close the end you do not use, in
+every process}. If the parent keeps the read end open while the child
+waits for EOF, the EOF never arrives (the kernel still counts the
+parent's copy as a reader), and the child hangs forever.
+
+\begin{ruleofthumb}[Close both ends you don't use, in both processes]
+After \code{fork}, each process must close the pipe end it will not
+use. Leaving a spare copy of the read end open is the classic way to
+make a reader wait forever for an EOF that can never come. Draw the
+descriptor table for every process in your program; there are never
+extra descriptors on purpose.
+\end{ruleofthumb}
+
+\section{The EOF Rule}
+
+When does \code{read} on a pipe return 0, signaling end of stream? The
+rule is precise: \emph{when every copy of the write end is closed}.
+EOF is not ``the writer has nothing more to say right now''; it is
+``no writer exists anymore, anywhere.''
+
+\begin{verbatim}
+   EOF rule: read() returns 0 only when NO write end remains open.
+
+   writer open                            all writers gone
+        |                                      |
+        v                                      v
+   read() returns bytes...            read() returns 0  ("end of stream")
+
+   This is why the child in the previous program could finish: the
+   parent wrote its bytes AND closed pfd[1]. If the parent had left
+   pfd[1] open, the child's read() would sit forever, even after the
+   last byte, because a writer still existed.
+\end{verbatim}
+
+The EOF rule is what makes pipes compose into pipelines: a downstream
+process knows the input is finished because the upstream process
+\emph{closed its end}. The closing, not any special marker byte, is
+the signal.
+
+\begin{osconcept}
+The EOF rule is a kernel decision about reference counting. The kernel
+tracks how many open descriptors name each pipe endpoint, and it is the
+one authority that knows when the count reaches zero. Your program
+cannot ``force'' an EOF; it can only close descriptors and let the
+kernel draw the conclusion. This is descriptor-table bookkeeping
+exposed as a data-flow event, and it is what lets processes signal
+completion without any extra protocol.
+\end{osconcept}
+
+\section{Pipelines: cmd1 | cmd2}
+
+With the EOF rule and \code{dup2} from Chapter~5 in hand, we can build
+the thing that made Unix famous: the \emph{pipeline}. ``Run the first
+program with its stdout connected to the second program's stdin.''
+The recipe has exactly four moves: create a pipe, fork the first
+command with its stdout re-pointed at the write end, fork the second
+with its stdin re-pointed at the read end, and have the parent close
+both pipe ends and wait.
+
+\begin{lstlisting}[caption={A two-stage pipeline, end to end.}]
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+
+/* Run "prog1..." with its stdout piped into "prog2...". */
+int run_pipeline(char *const argv1[], char *const argv2[]) {
+    int pfd[2];
+    pid_t p1;
+    pid_t p2;
+
+    if (pipe(pfd) < 0) {
+        perror("pipe");
+        return -1;
+    }
+
+    p1 = fork();
+    if (p1 < 0) {
+        perror("fork");
+        return -1;
+    }
+    if (p1 == 0) {
+        /* First command: stdout must name the pipe's write end. */
+        close(pfd[0]);
+        if (dup2(pfd[1], 1) < 0) {
+            perror("dup2");
+            exit(1);
+        }
+        close(pfd[1]);
+        execvp(argv1[0], argv1);
+        perror("execvp");
+        exit(127);
+    }
+
+    p2 = fork();
+    if (p2 < 0) {
+        perror("fork");
+        return -1;
+    }
+    if (p2 == 0) {
+        /* Second command: stdin must name the pipe's read end. */
+        close(pfd[1]);
+        if (dup2(pfd[0], 0) < 0) {
+            perror("dup2");
+            exit(1);
+        }
+        close(pfd[0]);
+        execvp(argv2[0], argv2);
+        perror("execvp");
+        exit(127);
+    }
+
+    /* The parent is only the referee: it needs neither pipe end. */
+    close(pfd[0]);
+    close(pfd[1]);
+
+    waitpid(p1, NULL, 0);
+    waitpid(p2, NULL, 0);
+    return 0;
+}
+
+int main(int argc, char *argv[]) {
+    char *cmd1[3];
+    char *cmd2[3];
+
+    if (argc != 5) {
+        fprintf(stderr, "usage: %s prog1 a1 prog2 a2\n", argv[0]);
+        return 1;
+    }
+    cmd1[0] = argv[1];
+    cmd1[1] = argv[2];
+    cmd1[2] = NULL;
+    cmd2[0] = argv[3];
+    cmd2[1] = argv[4];
+    cmd2[2] = NULL;
+
+    return run_pipeline(cmd1, cmd2);
+}
+\end{lstlisting}
+
+\begin{verbatim}
+   The wiring, drawn process by process:
+
+     p1 (child 1)                  p2 (child 2)
+     fd 1 --> pipe write end       fd 0 --> pipe read end
+           \                        /
+            \  +----------------+ /
+             \ | kernel buffer  |/
+              >| pfd[1] -> pfd[0]|
+              <|                |<   bytes flow p1 -> p2
+               +----------------+
+
+     parent: closes both ends; just waitpid()s both children.
+     dup2() copies the pipe descriptor ONTO descriptors 1 and 0, so
+     exec'd programs write to stdout / read from stdin without knowing
+     a pipe exists -- Chapter 5's redirection, exactly as the shell
+     does it.
+\end{verbatim}
+
+The magic ingredient is that \code{exec} preserves open descriptors:
+after \code{dup2} and \code{close}, the child \code{exec}s a totally
+new program whose \code{stdout} is the pipe, with no knowledge of the
+plumbing. That is why every Unix tool composes with every other tool:
+each reads \code{stdin} and writes \code{stdout}, and the shell---or
+your program---rewires the descriptors.
+
+\begin{verbatim}
+   The full lifecycle of "cat f.txt | sort":
+
+     1. shell pipe()s -> pfd = [3, 4]
+     2. shell forks child A: dup2(4, 1), close(3), close(4), exec cat
+        (cat's stdout is now the pipe)
+     3. shell forks child B: dup2(3, 0), close(3), close(4), exec sort
+        (sort's stdin is now the pipe)
+     4. shell closes 3 and 4, then waits for both
+     5. cat writes f.txt into the pipe; sort reads it, sorts, prints;
+        when cat exits and its stdout closes, the last write end dies,
+        sort's read() hits EOF, sort prints and exits, shell reaps both.
+\end{verbatim}
+
+\begin{osconcept}
+Pipelines work because the OS treats descriptors as \emph{rewireable
+connections} whose ownership can be transferred between processes and
+onto the standard slots. The kernel's descriptor-copying primitive
+(\code{dup2}) plus the EOF rule are the entire protocol---no message
+headers, no handshaking. Teaching processes to ``just write to fd 1''
+and letting the kernel route it is a design decision so good that it
+became the model for every later IPC mechanism.
+\end{osconcept}
+
+\section{SIGPIPE: When the Channel Dies}
+
+What happens if the reader is gone? Suppose the second command in a
+pipeline exits early, closing the read end, while the first command
+keeps writing. The kernel detects that a write has no readers and does
+two things: it sends \code{SIGPIPE} to the writer, and if the signal
+is ignored or handled, the \code{write} returns \code{-1} with
+\code{errno = EPIPE}.
+
+\begin{verbatim}
+   reader closes its read end, exits
+        |
+        v
+   writer calls write(fd1, ...)
+        |
+        +--> kernel finds no readers
+        |
+        +--> raises SIGPIPE on the writer
+        |      default action: terminate the writer (like `yes | head`)
+        |
+        +--> if SIGPIPE ignored/handled:
+             write() returns -1, errno = EPIPE
+
+   This is why `yes | head -1` terminates `yes` promptly: `head` closes
+   the pipe after one line, `yes` writes, the kernel SIGPIPEs it.
+\end{verbatim}
+
+For a well-behaved server or filter, the sensible choice is to ignore
+\code{SIGPIPE} and treat \code{EPIPE} as ``the peer went away''---an
+ordinary, expected condition, not a crash.
+
+\begin{lstlisting}[caption={Handling a dead reader gracefully.}]
+#include <stdio.h>
+#include <stdlib.h>
+#include <signal.h>
+#include <unistd.h>
+#include <errno.h>
+
+int main(void) {
+    struct sigaction sa;
+    char msg[16];
+    int i;
+
+    /* The reader may vanish; treat that as EPIPE, not death. */
+    sa.sa_handler = SIG_IGN;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGPIPE, &sa, NULL);
+
+    /* Write a line repeatedly until the reader goes away. */
+    for (i = 0; i < 100000; i++) {
+        ssize_t r;
+
+        snprintf(msg, sizeof(msg), "line %d\n", i);
+        r = write(1, msg, strlen(msg));
+        if (r < 0) {
+            if (errno == EPIPE) {
+                printf("reader is gone; stopping politely\n");
+                break;
+            }
+            perror("write");
+            break;
+        }
+    }
+    return 0;
+}
+\end{lstlisting}
+
+\begin{osconcept}
+\code{SIGPIPE} is the kernel's way of converting a dead channel into
+an interruptible event. The OS cannot know whether a missing reader is
+a bug or an expected teardown, so it gives the writer the choice:
+die by default, or catch the signal and inspect \code{EPIPE}. Choosing
+the default is the reason so many quick pipelines terminate cleanly;
+choosing the handler is what production services do so that a client
+disconnecting is not a crash.
+\end{osconcept}
+
+\section{Named Pipes (FIFOs)}
+
+An unnamed pipe lives and dies with the processes that created it. A
+\emph{named pipe}, or \emph{FIFO}, is a pipe with a name in the file
+system. Any process that can open the path can connect to it, so two
+unrelated processes---neither forking the other---can talk through a
+FIFO. You create one with \code{mkfifo} (the program or the syscall);
+you open it like a file; the data still flows through a kernel buffer,
+not through the file system.
+
+\begin{lstlisting}[caption={Creating and opening a FIFO.}]
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+int main(int argc, char *argv[]) {
+    int fd;
+
+    if (argc != 2) {
+        fprintf(stderr, "usage: %s fifo_name\n", argv[0]);
+        return 1;
+    }
+
+    /* Create the FIFO if it does not exist yet. */
+    if (mkfifo(argv[1], 0644) < 0) {
+        perror("mkfifo");   /* fine if it already exists (EEXIST) */
+    }
+
+    printf("opening %s for writing (blocks until a reader opens it)...\n",
+           argv[1]);
+    fd = open(argv[1], O_WRONLY);
+    if (fd < 0) {
+        perror("open");
+        return 1;
+    }
+
+    write(fd, "hello through a named pipe", 26);
+    close(fd);
+    return 0;
+}
+\end{lstlisting}
+
+\begin{verbatim}
+   FIFO = a pipe with an address in the file namespace:
+
+      $ mkfifo /tmp/chat
+      $ ./writer /tmp/chat &     (blocks: no reader yet)
+      $ cat /tmp/chat            (reader opens the other end)
+      hello through a named pipe
+
+   - The FIFO is a directory entry, but it holds NO data of its own.
+     Bytes go through the kernel pipe buffer; the path is just the
+     meeting point.
+   - open() BLOCKS until both a reader and a writer have opened the
+     FIFO. That rendezvous is the FIFO's version of pipe() + fork().
+   - When all readers or writers close, the pipe state resets: a later
+     open() gets a fresh buffer, so data written earlier is gone.
+\end{verbatim}
+
+\begin{osconcept}
+A FIFO is the file system serving as a \emph{namespace} for IPC. The
+kernel already owns the directory tree, permissions, and lookup; giving
+a pipe a path reuses all of that machinery so that unrelated processes
+can rendezvous by name. Deciding that the path is only an address---not
+a store of data---is an OS design choice that keeps FIFOs cheap and
+their semantics identical to anonymous pipes.
+\end{osconcept}
+
+\section{The IPC Menu}
+
+Pipes are one of five classic channels. The others appear later in the
+book; a map now will save you confusion when we meet them.
+
+\begin{verbatim}
+   mechanism        data model          who can talk        we meet it
+   --------------   ----------------    ----------------    ----------
+   pipe / FIFO      byte stream,        parent-child or     this chapter
+                    kernel-buffered     any named pair
+   signal           tiny events         any processes       chapter 5
+                    (an integer)
+   shared memory    raw bytes, no       processes that      chapter 11
+   (mmap)           kernel copy         agree on a region
+   message queue    typed messages,     any processes       (surveyed)
+                    kernel-buffered     with permissions
+   socket           byte stream or      any processes,      chapter 16
+                    datagrams           even across hosts
+
+   The trade-off in one line: pipes and sockets BUFFER and COPY (safe,
+   automatic), while shared memory does NOT (fast, dangerous). You
+   choose based on whether you want the kernel to babysit your data.
+\end{verbatim}
+
+\begin{verbatim}
+   The rule of thumb for this book's projects:
+
+     one writer, one reader, stream data  -> pipe
+     unrelated processes, named channel   -> FIFO
+     lots of small structured messages    -> message queue
+     fast shared state, both are careful  -> shared memory (ch.12)
+     any machine, any distance            -> sockets (ch.17)
+\end{verbatim}
+
+\begin{researchnote}[Pipes are communication as mathematics]
+The pipe is not just a Unix convenience; it is the direct implementation
+of a celebrated idea. In 1978, C.~A.~R.~Hoare published
+``Communicating Sequential Processes,'' arguing that the cleanest way
+to think about concurrency is as \emph{processes that exchange data by
+message passing}, with no shared state at all. A pipe is exactly that:
+two processes, one channel, bytes in order.
+
+\begin{verbatim}
+   Hoare's thesis, condensed to one line:
+
+       "Programs are built from sequential processes that interact
+        solely by input and output; shared memory is unnecessary and
+        harmful."
+
+   This is the philosophy the pipe implements: the writer and reader
+   never share a variable, never lock anything, and are correct purely
+   because the channel delivers bytes in order. Hoare's later book of
+   the same name turned this into a formal language for reasoning
+   about concurrency.
+\end{verbatim}
+
+Why it matters to you: the same idea drives most real servers
+(Chapter~17) and the concurrency chapter (Chapter~11). When a design
+uses pipes or sockets to connect worker processes, it is inheriting a
+four-decade-old research result about how to make concurrency
+\emph{provable} instead of merely probable.
+
+\paperref{C.~A.~R.~Hoare, ``Communicating Sequential Processes,''
+Communications of the ACM 21(8), 1978}{https://www.cs.cmu.edu/~crary/819-f09/Hoare78.pdf}
+\end{researchnote}
+
+\section{Practical: A Two-Stage Filter Shell}
+
+Let us wire the chapter together into a small program that behaves like
+a real shell pipeline: read a command line like
+\code{prog1 arg prog2 arg}, split it, and run it through a pipe---the
+exact four-move recipe, with every error checked and every unused
+descriptor closed.
+
+\begin{lstlisting}[caption={piperun.c: parse two commands and pipe them together.}]
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+
+#define MAX_ARG 32
+
+/* Split "cmd arg1 arg2 | cmd arg1" into two NULL-terminated argv arrays. */
+int parse_pipeline(char *line, char ***left, char ***right) {
+    char *pipe_pos;
+    char **a;
+    char *tok;
+    int n;
+
+    pipe_pos = strchr(line, '|');
+    if (pipe_pos == NULL) {
+        return -1;      /* no pipe found */
+    }
+    *pipe_pos = '\0';
+
+    a = malloc(MAX_ARG * sizeof(char *));
+    if (a == NULL) {
+        return -1;
+    }
+    n = 0;
+    tok = strtok(line, " \t\n");
+    while (tok != NULL && n < MAX_ARG - 1) {
+        a[n] = tok;
+        n = n + 1;
+        tok = strtok(NULL, " \t\n");
+    }
+    a[n] = NULL;
+    *left = a;
+
+    a = malloc(MAX_ARG * sizeof(char *));
+    if (a == NULL) {
+        return -1;
+    }
+    n = 0;
+    tok = strtok(pipe_pos + 1, " \t\n");
+    while (tok != NULL && n < MAX_ARG - 1) {
+        a[n] = tok;
+        n = n + 1;
+        tok = strtok(NULL, " \t\n");
+    }
+    a[n] = NULL;
+    *right = a;
+
+    return 0;
+}
+
+/* Run the pipeline built by parse_pipeline. */
+int run_pipeline(char *const left[], char *const right[]) {
+    int pfd[2];
+    pid_t p1;
+    pid_t p2;
+
+    if (pipe(pfd) < 0) {
+        perror("pipe");
+        return -1;
+    }
+
+    p1 = fork();
+    if (p1 < 0) {
+        perror("fork");
+        return -1;
+    }
+    if (p1 == 0) {
+        close(pfd[0]);
+        dup2(pfd[1], 1);
+        close(pfd[1]);
+        execvp(left[0], left);
+        perror("execvp");
+        exit(127);
+    }
+
+    p2 = fork();
+    if (p2 < 0) {
+        perror("fork");
+        return -1;
+    }
+    if (p2 == 0) {
+        close(pfd[1]);
+        dup2(pfd[0], 0);
+        close(pfd[0]);
+        execvp(right[0], right);
+        perror("execvp");
+        exit(127);
+    }
+
+    close(pfd[0]);
+    close(pfd[1]);
+
+    waitpid(p1, NULL, 0);
+    waitpid(p2, NULL, 0);
+    return 0;
+}
+
+int main(void) {
+    char line[512];
+    char **left;
+    char **right;
+
+    printf("piperun> ");
+    fflush(stdout);
+    while (fgets(line, sizeof(line), stdin) != NULL) {
+        if (parse_pipeline(line, &left, &right) == 0) {
+            run_pipeline(left, right);
+            free(left);
+            free(right);
+        } else {
+            printf("need two commands separated by a pipe\n");
+        }
+        printf("piperun> ");
+        fflush(stdout);
+    }
+    return 0;
+}
+\end{lstlisting}
+
+\begin{verbatim}
+   Try it:
+
+     $ ./piperun
+     piperun> echo hello world | tr a-z A-Z
+     HELLO WORLD
+     piperun> seq 10 | tail -3
+     8
+     9
+     10
+     piperun> ^D
+
+   Every line you typed exercised the whole chapter: a kernel buffer,
+   two forks, two dup2 rewirings, four closes, and two waits. That is
+   a shell's pipeline in miniature.
+\end{verbatim}
+
+\section{Structures in Bytes}
+
+A pipe is a kernel object, so its byte structure lives in the kernel;
+in your process a pipe is just two small integers. The object they
+name looks like this (Linux):
+
+\begin{verbatim}
+   the pipe: a ring buffer of 16 pages = 64 KB.
+
+   +---------+---------+---------+-- ... --+---------+
+   | page 0  | page 1  | page 2  |          | page 15 |
+   +---------+---------+---------+-- ... --+---------+
+        ^ read position               ^ write position
+        (byte offsets into the ring)
+
+   the two file objects name the same pipe:
+
+   file object (read end)  \   +---------------------+
+   file object (write end) /-->| pipe: 16 pages      |
+                              | read pos            |
+                              | write pos           |
+                              | nreaders, nwriters  |  <- the EOF rule
+                              +---------------------+
+\end{verbatim}
+
+Writes land at the write position, wrap around the ring, and advance
+it; reads do the same at the read position. The reference counts are
+the byte-level truth behind the EOF rule: \code{read()} returns 0 not
+because a marker byte exists, but because the \code{nwriters} counter
+reached zero. The ring is also why blocking is cheap---a writer with no
+room sleeps until a reader advances the read position.
+
+\section{Summary}
+
+\begin{verbatim}
+   The pipe model, complete:
+
+   pipe()      : one call, two descriptors, one kernel buffer
+   fork()      : duplicates the descriptors into both processes
+   close()     : each side drops the end it does not use
+   blocking    : the kernel parks readers on empty, writers on full
+   EOF         : read() returns 0 when the last write end closes
+   dup2()      : rewires a descriptor, building pipelines
+   SIGPIPE     : the kernel tells a writer its reader is gone
+   FIFO        : the same channel, given a name in the file system
+
+   Rules that keep pipe programs correct:
+     1. close the unused end in EVERY process (the EOF killer);
+     2. the parent (or middleman) closes BOTH ends;
+     3. remember pipes are byte streams: no message boundaries;
+     4. expect blocking: it is the feature, not a bug;
+     5. handle SIGPIPE (or EPIPE) when a peer may disconnect.
+\end{verbatim}
+
+\begin{osconcept}
+This chapter was a complete answer to ``how do isolated processes
+talk?'' The OS answers: through channels it alone owns---buffers that
+synchronize, reference counts that produce EOF, signals that report a
+dead peer, and names that let strangers rendezvous. Every later IPC
+mechanism is a variation on these same ideas, and the discipline
+(close your ends, check your returns) never changes.
+\end{osconcept}
+
+The pipes we just built are \emph{synchronous}: the writer is paced by
+the reader. In the chapters ahead we make communication more powerful
+and more dangerous: threads sharing one address space (Chapter~11),
+shared memory with no kernel copy (Chapter~12), and finally sockets
+that cross machine boundaries (Chapter~17).
+

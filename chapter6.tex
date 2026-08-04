@@ -1,0 +1,868 @@
+% ============================================================================
+%  chapter6.tex
+%  Signals: Asynchronous Events and Their Handlers
+% ============================================================================
+
+\chapter{Signals: Asynchronous Events and Their Handlers}
+
+\section{What Is a Signal?}
+
+Everything so far has been synchronous: your code ran, made a system
+call, and waited for the answer. Signals are the operating system
+breaking that rule. A \emph{signal} is a small, asynchronous
+notification delivered to a process. It can arrive at \emph{any}
+moment---between any two of your instructions---and it is not requested
+by your code. It simply happens to you.
+
+The kernel generates signals for a dizzying variety of reasons:
+
+\begin{verbatim}
+   WHO OR WHAT FIRES   SIGNAL        WHY
+   ----------------   ----------    ----------------------------------
+   you press Ctrl-C    SIGINT        the terminal driver asks you to stop
+   you press Ctrl-\    SIGQUIT       stop and leave a core dump
+   kill command        SIGTERM       polite shutdown request
+   kill -9 command     SIGKILL       unignorable kill
+   your program derefs SIGSEGV       invalid memory access (ch.1's abyss)
+   a timer expires     SIGALRM       alarm() went off
+   a child exits       SIGCHLD       "your child is done; go collect it"
+   writing a dead pipe SIGPIPE       the reader of a pipe has gone away
+   stop command        SIGSTOP       freeze this process (uncatchable)
+   you type a TSTP     SIGTSTP       Ctrl-Z: stop, but catchable
+\end{verbatim}
+
+\begin{verbatim}
+   Time flows left to right. Signals arrive OUT OF BAND:
+
+     your code:  ----instr--instr--instr--instr--instr--instr--instr---
+                              |                  |
+                              v                  v
+                          SIGINT           SIGSEGV
+                          (Ctrl-C)          (bug!)
+
+     The handler runs, returns, and your code resumes at the very next
+     instruction. From your code's point of view, a signal is a hidden
+     function call injected by the kernel.
+\end{verbatim}
+
+A signal is really just a small integer (1--31 on Linux, with a range
+of real-time signals beyond that). All the meaning lives in the
+\emph{disposition} the process has registered for it and in the default
+action the kernel would take if the process has not.
+
+\begin{osconcept}
+Only the kernel can deliver signals, because only the kernel can
+\emph{interrupt a running process}. A process is a passive guest of the
+CPU; it cannot pause itself to receive a notification. The kernel, which
+controls the CPU, must notice events (keys, timers, child deaths) and
+inject them into the victim process's execution. Asynchronous event
+delivery is thus an operating system problem by construction: the OS is
+the only actor with the power and the global view to do it.
+\end{osconcept}
+
+\section{The Default Actions}
+
+When a signal arrives and the process has no custom handler, the kernel
+applies one of a small set of \emph{default actions}. There are exactly
+five of them, and every signal's default is one of these:
+
+\begin{verbatim}
+   default action     meaning                          examples
+   ----------------   -------------------------------  ---------
+   terminate          kill the process                SIGHUP SIGINT SIGTERM
+   core dump          terminate + save core image     SIGSEGV SIGQUIT SIGABRT
+   stop               suspend the process             SIGSTOP SIGTSTP
+   continue           resume a stopped process        SIGCONT
+   ignore             do nothing                      SIGCHLD SIGURG
+
+   So "Ctrl-C kills my program" is not a rule of the language; it is
+   the DEFAULT action for SIGINT, which is why Ctrl-C works the same
+   in every program whether or not it knows about signals.
+\end{verbatim}
+
+Two signals have no handler, period. \code{SIGKILL} and
+\code{SIGSTOP} are the kernel's own kill switch: they cannot be caught,
+blocked, or ignored. If any process could block \code{SIGKILL}, a
+runaway program could make itself immortal; the OS would lose its
+ultimate authority. Their existence is the sign that signals are not a
+programmer convenience but an operating system mechanism.
+
+\begin{osconcept}
+The default-action table is operating system policy. The kernel must
+decide, for every possible event, what happens to a process that has
+not expressed an opinion---and that decision must hold even when the
+process is broken (a dereferenced \code{NULL}, an illegal instruction).
+Core dumps, process reaping, and the uncatchable \code{SIGKILL} are all
+designed at the OS level to keep the whole system rescuable, not merely
+each individual process.
+\end{osconcept}
+
+\section{The Three Dispositions}
+
+For every signal except \code{SIGKILL} and \code{SIGSTOP}, a process
+chooses one of three \emph{dispositions}: let the kernel use the
+default, ignore the signal outright, or run a function of your own.
+That function is the \emph{signal handler}.
+
+\begin{verbatim}
+   disposition          what the kernel does when the signal arrives
+   ------------------   ----------------------------------------------
+   SIG_DFL  (default)   apply the default action from the table above
+   SIG_IGN  (ignore)    discard the signal, as if it never happened
+   handler  (custom)    call your function, then resume your code
+
+   Default is the starting state of every signal. You override it.
+\end{verbatim}
+
+The modern, portable way to install a disposition is
+\code{sigaction}, which tells the kernel everything about your handler
+in one structure. (The older \code{signal} call behaves differently on
+different Unixes; in this book we use \code{sigaction} and forget
+\code{signal} exists.)
+
+\begin{lstlisting}[caption={Installing a handler with sigaction.}]
+#include <stdio.h>
+#include <signal.h>
+#include <unistd.h>
+
+/* Runs when SIGINT arrives. "sig" tells you which signal fired. */
+static void handle_sigint(int sig) {
+    write(1, "interrupted!\n", 13);
+}
+
+int main(void) {
+    struct sigaction sa;
+
+    sa.sa_handler = handle_sigint;
+    sigemptyset(&sa.sa_mask);     /* nothing extra blocked during it */
+    sa.sa_flags = 0;
+
+    if (sigaction(SIGINT, &sa, NULL) < 0) {
+        perror("sigaction");
+        return 1;
+    }
+
+    printf("press Ctrl-C (or send SIGINT) ...\n");
+    while (1) {
+        sleep(1);
+    }
+    return 0;
+}
+\end{lstlisting}
+
+\begin{verbatim}
+   What just happened:
+
+     struct sigaction sa;      describes the desired behavior
+     sa.sa_handler            the function to run
+     sa.sa_mask               signals to block WHILE the handler runs
+     sa.sa_flags              options (more below)
+
+     sigaction(SIGINT, &sa, NULL)
+         ^signal   ^new behavior   ^old behavior (NULL = don't care)
+
+   When Ctrl-C arrives, the kernel saves your state, runs
+   handle_sigint(2), restores your state, and your loop continues
+   exactly where it was interrupted.
+\end{verbatim}
+
+Notice the handler writes with \code{write(2)}, not \code{printf}.
+That is not a stylistic tic; it is a hard rule, and we will justify it
+in Section~6.6.
+
+\begin{osconcept}
+Dispositions are kernel state attached to the process, not program
+state. The kernel must remember, for each of dozens of signals, what to
+do on delivery, and it must honor that even when the process is deep in
+some library you do not control. Registering a handler, validating it,
+and switching behavior at the exact moment of delivery is kernel work;
+your \code{sigaction} call is just writing an entry in a table the
+kernel maintains and consults.
+\end{osconcept}
+
+\section{Blocking, Pending, and Delivered}
+
+A signal does not necessarily get delivered the instant it is
+generated. The kernel runs a small state machine for each signal of
+each process, with three states:
+
+\begin{verbatim}
+   GENERATED          BLOCKED?            DELIVERED
+   (event happens)    process asked       kernel runs the handler
+                      to delay it?        (or default action)
+        |                   |
+        +----> pending -----+----> if unblocked, deliver now
+        |     (waiting)            if blocked, keep pending
+        |
+        +-----------------+-----------> delivered immediately
+
+   - A BLOCKED signal is not lost: it sits "pending" and is delivered
+     the moment the process unblocks it.
+   - Standard signals COALESCE: ten SIGINTs generated while blocked
+     are delivered as ONE. The kernel remembers "a SIGINT is pending",
+     not "ten SIGINTs are pending".
+   - A signal that arrives while its own handler is running may be
+     delivered again (or blocked, per sa.sa_mask).
+\end{verbatim}
+
+Blocking is done with a \emph{signal set}, manipulated through
+\code{sigset\_t} and friends:
+
+\begin{lstlisting}[caption={Block, then unblock, a signal.}]
+#include <stdio.h>
+#include <stdlib.h>
+#include <signal.h>
+#include <unistd.h>
+
+static void handle_sigint(int sig) {
+    write(1, "SIGINT handled\n", 15);
+}
+
+int main(void) {
+    struct sigaction sa;
+    sigset_t block_set;
+    sigset_t old_set;
+    int i;
+
+    sa.sa_handler = handle_sigint;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, NULL);
+
+    /* 1. Block SIGINT: it will now go pending instead of being delivered. */
+    sigemptyset(&block_set);
+    sigaddset(&block_set, SIGINT);
+    sigprocmask(SIG_BLOCK, &block_set, &old_set);
+
+    printf("SIGINT is now blocked. Send one (Ctrl-C in another terminal,\n");
+    printf("or `kill -INT %d` from a shell). Sleeping 3 seconds...\n", getpid());
+    sleep(3);
+
+    /* 2. Unblock: any SIGINT that arrived is delivered NOW. */
+    printf("unblocking...\n");
+    sigprocmask(SIG_SETMASK, &old_set, NULL);
+
+    sleep(2);
+    return 0;
+}
+\end{lstlisting}
+
+\begin{verbatim}
+   The blocked interval:
+
+     you send SIGINT           3 seconds later you unblock
+        |                             |
+        v                             v
+   +---------+  blocked,       +-----+  delivered now, handler runs
+   | pending |  then one        |     |
+   | SIGINT  |  unblock --->    |  !  |----->  write("SIGINT handled")
+   +---------+                  +-----+
+\end{verbatim}
+
+\begin{ruleofthumb}[Block the signal during its own handler]
+Unless you want a handler to be re-entered, add the signal you are
+handling to \code{sa.sa\_mask}. Simpler still: make handlers set a
+\emph{flag} and do all real work in the main loop (Section~6.7); then
+re-entrancy stops being a question you have to answer.
+\end{ruleofthumb}
+
+\begin{osconcept}
+The pending/blocked/delivered state machine lives entirely in the
+kernel. Only the kernel can decide when a process is at a safe point to
+run a handler, and only the kernel can hold a signal in limbo without
+losing it. A process cannot "pause" its own execution safely---it has
+no authority over the scheduler. The signal lifecycle is therefore
+kernel bookkeeping, exposed to you as three tiny calls.
+\end{osconcept}
+
+\section{What You May Do in a Handler}
+
+Here is the discipline that keeps signal programming honest: a handler
+runs \emph{asynchronously}, between two arbitrary instructions of your
+main program. If the handler calls a function that your main program is
+midway through using---\code{malloc}, for example---the two can corrupt
+each other. A handler may therefore call only \emph{async-signal-safe}
+functions, a short list blessed by POSIX. \code{printf}, \code{malloc},
+\code{strcpy}, and \code{free} are \emph{not} on it. \code{write},
+\code{read}, \code{waitpid}, \code{kill}, \code{\_exit}, and
+\code{sigaction} are.
+
+\begin{verbatim}
+   ASYNC-SIGNAL-SAFE (safe in a handler)     NOT safe in a handler
+   -------------------------------          ----------------------
+   write(2), read(2)                         printf, sprintf, puts
+   _exit(2)                                  exit, malloc, free
+   kill(2), raise(3), waitpid(2)             strcpy, strlen, memcpy
+   sigaction, sigprocmask                    fopen, fclose, fflush
+   alarm(2), getpid(2)                       any code that locks
+\end{verbatim}
+
+The consequence is that a handler usually does almost nothing. The
+canonical pattern is a \emph{flag}: the handler sets a variable, the
+main loop checks it. The variable must be \code{volatile} (so the
+compiler does not cache it in a register across the async change) and
+of type \code{sig\_atomic\_t} (an integer type guaranteed to be
+readable and writable in one atomic step).
+
+\begin{lstlisting}[caption={The flag pattern: handler sets, main loop acts.}]
+#include <stdio.h>
+#include <signal.h>
+#include <unistd.h>
+
+/* Set by the handler, read by main. volatile sig_atomic_t is the
+   one type guaranteed safe for this two-way traffic.              */
+static volatile sig_atomic_t got_sigint = 0;
+
+static void handle_sigint(int sig) {
+    got_sigint = 1;       /* the ONLY thing the handler does */
+}
+
+int main(void) {
+    struct sigaction sa;
+    int ticks;
+
+    sa.sa_handler = handle_sigint;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, NULL);
+
+    ticks = 0;
+    while (got_sigint == 0) {
+        ticks = ticks + 1;
+        printf("tick %d\n", ticks);
+        sleep(1);
+    }
+
+    printf("SIGINT received; the loop noticed within a second.\n");
+    return 0;
+}
+\end{lstlisting}
+
+\begin{verbatim}
+   The division of labor:
+
+     signal arrives ----> handler runs:   got_sigint = 1;
+     (kernel thread of execution)         (safe: one atomic store)
+
+     main loop       ----> checks:        while (got_sigint == 0)
+     (your thread of execution)           ... does the real work
+
+   The handler and the main loop are like two coroutines sharing one
+   int. Everything that is complicated--printing, allocating, closing
+   files--belongs in the main loop, where the whole library is safe.
+\end{verbatim}
+
+\begin{osconcept}
+The async-signal-safe list exists because the kernel delivers signals
+at moments it alone chooses, without coordinating with your libraries.
+POSIX (the OS standard) must therefore guarantee that a specific subset
+of functions never internally allocates, never locks, and never needs
+your program's state to be consistent. Whether a function may be called
+from a handler is an operating-system-contract decision, not a language
+decision. It is the kernel's interrupt model that forces it.
+\end{osconcept}
+
+\section{SIGCHLD: Reaping Children Asynchronously}
+
+Chapter~5 ended with a parent that calls \code{waitpid} and blocks
+until its child finishes. But what if the parent is busy serving
+requests and children finish at unpredictable moments? It cannot sit in
+\code{waitpid}. The answer is \code{SIGCHLD}: the kernel sends it to a
+parent \emph{whenever} a child changes state---exits, stops, or
+continues. The parent installs a \code{SIGCHLD} handler, and the handler
+reaps whatever children have died since the last sweep.
+
+The handler must loop: several children may have exited, and
+\code{SIGCHLD} \emph{coalesces}, so one signal may stand for many dead
+children. The loop drains the pipe:
+
+\begin{lstlisting}[caption={Reaping every dead child with WNOHANG.}]
+#include <stdio.h>
+#include <stdlib.h>
+#include <signal.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+static volatile sig_atomic_t children_changed = 0;
+
+static void handle_child(int sig) {
+    children_changed = 1;
+}
+
+/* Called from the MAIN loop, never from the handler itself. */
+void reap_children(void) {
+    pid_t done;
+    int status;
+
+    while (1) {
+        done = waitpid(-1, &status, WNOHANG);
+        if (done == 0) {
+            break;          /* no more children have exited */
+        }
+        if (done < 0) {
+            break;          /* ECHILD: no children left at all */
+        }
+        if (WIFEXITED(status)) {
+            printf("child %d exited with status %d\n",
+                   (int) done, WEXITSTATUS(status));
+        }
+    }
+}
+
+int main(void) {
+    struct sigaction sa;
+    int i;
+
+    sa.sa_handler = handle_child;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGCHLD, &sa, NULL);
+
+    /* Spawn three short-lived children. */
+    for (i = 0; i < 3; i++) {
+        pid_t pid;
+
+        pid = fork();
+        if (pid == 0) {
+            exit(10 + i);
+        }
+    }
+
+    /* Busy loop: do work, and check whether reaping is due. */
+    for (i = 0; i < 10; i++) {
+        sleep(1);
+        if (children_changed) {
+            children_changed = 0;
+            reap_children();
+        }
+    }
+
+    return 0;
+}
+\end{lstlisting}
+
+\begin{verbatim}
+   What SIGCHLD reaping prevents:
+
+      children exit            zombie count
+      -------------            ------------
+      3 children finish        the handler's waitpid(-1, WNOHANG)
+      (3 SIGCHLD coalesce      loop reaps ALL THREE in one call,
+       into possibly 1 signal) so no zombie survives more than a
+                               signal delivery.
+
+   WITHOUT the loop (just one waitpid in the handler): two children
+   stay zombies until the next SIGCHLD or the parent exits. WITH it,
+   the drain loop guarantees every corpse is collected.
+\end{verbatim}
+
+\begin{ruleofthumb}[WNOHANG is non-negotiable here]
+Inside a \code{SIGCHLD} handler, you must use \code{waitpid(-1,
+\&status, WNOHANG)} and loop. A plain \code{waitpid(pid,...)} would
+block if no child has exited, freezing the process inside the handler
+forever. \code{WNOHANG} means ``don't wait; tell me right now what's
+ready,'' which is exactly the contract an asynchronous reaper needs.
+\end{ruleofthumb}
+
+\begin{osconcept}
+Zombie reaping, introduced in Chapter~5, becomes an event-driven
+problem here, and the OS solves it by \emph{fusing} the two mechanisms:
+child death generates \code{SIGCHLD} automatically, and \code{waitpid}
+collects the result. The kernel chooses to deliver one signal per state
+change (coalescing repeats), and it is what keeps the process tree
+clean without the parent babysitting every child. Connecting process
+lifecycle events to the signal mechanism is a deliberate piece of
+operating system design.
+\end{osconcept}
+
+\section{Sending Signals: kill and raise}
+
+Signals flow in both directions. \code{kill(pid, sig)} sends a signal
+to another process (given permission); \code{raise(sig)} sends one to
+yourself; \code{kill(0, sig)} sends to your whole process group. The
+permission rule is the kernel's: you may signal a process you own, or
+one owned by the same user (or root can signal anyone).
+
+\begin{lstlisting}[caption={Sending signals, three ways.}]
+#include <stdio.h>
+#include <stdlib.h>
+#include <signal.h>
+#include <unistd.h>
+
+int main(void) {
+    pid_t pid;
+
+    pid = fork();
+    if (pid < 0) {
+        perror("fork");
+        exit(1);
+    }
+
+    if (pid == 0) {
+        /* Child: announce itself, then idle forever. */
+        printf("child %d sleeping...\n", getpid());
+        while (1) {
+            sleep(1);
+        }
+    }
+
+    /* Parent: give the child a moment, then say goodnight. */
+    sleep(1);
+    printf("sending SIGTERM to child %d\n", (int) pid);
+    if (kill(pid, SIGTERM) < 0) {
+        perror("kill");
+        exit(1);
+    }
+
+    sleep(1);
+    return 0;
+}
+\end{lstlisting}
+
+\begin{verbatim}
+   kill(pid, 0) is a useful trick: it sends NO signal, but succeeds if
+   the process exists and you may signal it. "kill -0" is a test of
+   existence and permission, widely used in scripts.
+
+   raise(SIGTERM) == kill(getpid(), SIGTERM)   -- signal yourself.
+   alarm(5)      : the kernel arranges to send SIGALRM in 5 seconds.
+   pause()       : block until ANY signal arrives.
+\end{verbatim}
+
+\begin{osconcept}
+Permission checking on \code{kill} is kernel work: before delivering,
+the kernel verifies the sender owns the target (or is root), because
+letting arbitrary processes terminate each other would be a denial of
+service. The \emph{capability} to signal someone is a form of
+authority the kernel hands out and enforces. \code{kill(pid, 0)}
+exists only because that same authority needs a non-destructive test.
+\end{osconcept}
+
+\section{alarm: A Signal in the Future}
+
+\code{alarm(n)} asks the kernel to send \code{SIGALRM} to your process
+in \code{n} seconds---exactly once. It is the classic way to enforce
+timeouts on operations that might hang, because \code{SIGALRM}
+interrupts the current system call. Its default action is termination,
+so installing a handler (or using it with \code{sigaction}) turns a
+hang into a manageable event.
+
+\begin{lstlisting}[caption={A timeout guard around an I/O read.}]
+#include <stdio.h>
+#include <stdlib.h>
+#include <signal.h>
+#include <unistd.h>
+#include <errno.h>
+
+static volatile sig_atomic_t timed_out = 0;
+
+static void handle_alarm(int sig) {
+    timed_out = 1;
+}
+
+int main(void) {
+    struct sigaction sa;
+    char buf[64];
+    ssize_t got;
+
+    sa.sa_handler = handle_alarm;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGALRM, &sa, NULL);
+
+    printf("you have 5 seconds to type a line\n");
+
+    alarm(5);
+    got = read(0, buf, sizeof(buf));     /* may be interrupted by SIGALRM */
+    alarm(0);                            /* cancel the timer */
+
+    if (timed_out) {
+        printf("\ntimeout; giving up\n");
+        return 1;
+    }
+    if (got < 0) {
+        perror("read");
+        return 1;
+    }
+
+    printf("you typed %zd bytes\n", got);
+    return 0;
+}
+\end{lstlisting}
+
+\begin{verbatim}
+   The timeline when the user types nothing:
+
+     t=0  alarm(5)  begins
+     t=5  SIGALRM delivered  -->  handle_alarm() sets timed_out
+     t=5  read() returns -1, errno = EINTR   (see next section)
+     main sees timed_out == 1 and gives up.
+
+   alarm(0) cancels a pending alarm. Real applications time out
+   network reads, locks, and whole requests this way--the signal is
+   the kernel's ticking clock.
+\end{verbatim}
+
+\section{EINTR: When a Signal Interrupts a System Call}
+
+Here is the subtle interaction that causes the classic bug in signal
+programming. While your process is blocked inside a \emph{slow}
+system call (\code{read} on a pipe or terminal, \code{waitpid},
+\code{sleep}), a signal arrives. The kernel must run the handler. The
+only safe way is to make the system call return \emph{prematurely}, so
+the handler can run in your context. The call returns \code{-1} with
+\code{errno = EINTR}, ``interrupted by signal.''
+
+\begin{verbatim}
+   blocked in read()               SIGTERM arrives
+        |                                |
+        |  read returns -1,             v
+        |  errno = EINTR          handler runs
+        |                                |
+        +----- your code: is EINTR an   |
+              error or a "retry"?  <-----+
+              It is a RETRY: the operation did not fail, it was
+              postponed. Standard practice:
+
+                 while (got < 0 && errno == EINTR) {
+                     got = read(fd, buf, n);
+                 }
+\end{verbatim}
+
+Two ways to cope. The manual way wraps every slow call in an
+\code{EINTR} retry loop. The automatic way sets \code{SA\_RESTART} in
+\code{sa.sa\_flags}, asking the kernel to restart interrupted calls
+itself---but note that \code{read} on a pipe, \code{waitpid}, and a few
+others are \emph{not} restartable by it, so the manual loop is the
+portable truth.
+
+\begin{lstlisting}[caption={The universal EINTR retry loop.}]
+#include <unistd.h>
+#include <errno.h>
+
+/* Read up to n bytes, restarting if a signal interrupts us. */
+ssize_t read_eintr(int fd, void *buf, size_t n) {
+    ssize_t got;
+
+    while (1) {
+        got = read(fd, buf, n);
+        if (got < 0 && errno == EINTR) {
+            continue;      /* a signal arrived; retry, don't give up */
+        }
+        return got;        /* real result: n, k<n, 0 (EOF), or an error */
+    }
+}
+\end{lstlisting}
+
+\begin{osconcept}
+The kernel's decision to interrupt slow system calls is what makes
+asynchronous delivery \emph{possible at all}: a handler cannot run
+inside a blocked call, so the kernel must unwind the call, deliver, and
+let your code decide what to do next. \code{EINTR} is therefore not a
+bug in your code; it is the visible trace of the kernel's interrupt
+mechanism. Designing which calls restart automatically and which do
+not is an operating system judgment call, and \code{SA\_RESTART} is the
+kernel exposing that choice to you.
+\end{osconcept}
+
+\section{Practical: A Graceful Shutdown Server}
+
+Let us assemble the chapter into the pattern that real daemons use:
+handle \code{SIGTERM}/\code{SIGINT} by setting a flag, check it in the
+main loop, and reap children via \code{SIGCHLD}. The handlers do almost
+nothing; all work happens in the main loop where the full standard
+library is safe.
+
+\begin{lstlisting}[caption={server.c: flag-based shutdown plus asynchronous reaping.}]
+#include <stdio.h>
+#include <stdlib.h>
+#include <signal.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+
+static volatile sig_atomic_t g_running = 1;
+static volatile sig_atomic_t g_children = 0;
+
+static void handle_shutdown(int sig) {
+    g_running = 0;          /* ask the main loop to finish */
+}
+
+static void handle_child(int sig) {
+    g_children = 1;         /* ask the main loop to reap   */
+}
+
+void reap_children(void) {
+    pid_t done;
+    int status;
+
+    while (1) {
+        done = waitpid(-1, &status, WNOHANG);
+        if (done <= 0) {
+            break;
+        }
+        if (WIFEXITED(status)) {
+            printf("reaped child %d (status %d)\n",
+                   (int) done, WEXITSTATUS(status));
+        } else if (WIFSIGNALED(status)) {
+            printf("reaped child %d (signal %d)\n",
+                   (int) done, WTERMSIG(status));
+        }
+    }
+}
+
+int main(void) {
+    struct sigaction sa;
+
+    /* One handler for both termination signals. */
+    sa.sa_handler = handle_shutdown;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+
+    sa.sa_handler = handle_child;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGCHLD, &sa, NULL);
+
+    printf("server running (pid %d). Try: kill -TERM %d\n",
+           getpid(), getpid());
+
+    while (g_running) {
+        if (g_children) {
+            g_children = 0;
+            reap_children();
+        }
+        /* In a real server: accept a connection, fork a worker... */
+        sleep(1);
+    }
+
+    printf("shutdown complete; resources cleaned up\n");
+    return 0;
+}
+\end{lstlisting}
+
+\begin{verbatim}
+   What happens end to end:
+
+     kill -TERM <pid>  --->  SIGTERM  --->  handle_shutdown
+                                              |  g_running = 0
+     the main loop's next check of g_running  |
+     sees 0, exits the loop, cleans up,       |
+     returns from main.  <-------------------+
+
+     A child exits  ----->  SIGCHLD  --->  handle_child
+                                              |  g_children = 1
+     the main loop reaps every zombie with    |
+     waitpid(-1, WNOHANG).  <----------------+
+
+   Both handlers are two assignments. The main loop is the only place
+   that prints, allocates, or calls anything complex. That is the whole
+   art of signal programming.
+\end{verbatim}
+
+\begin{researchnote}[Why the flag-and-loop pattern wins]
+The graceful-shutdown server you just built is \emph{event-driven}: one
+loop, a few flags, and all slow work done inline. This is not merely a
+style preference; it is a design conclusion with a famous champion.
+John Ousterhout, the creator of Tcl/Tk and a leading systems
+researcher, argued in a widely-cited essay that a single event-driven
+loop is easier to make correct than a design where many concurrent
+activities each block on their own.
+
+\begin{verbatim}
+   The essay's central claim (paraphrased):
+
+       "Concurrency via threads is hard to program correctly, and for
+        most applications an event-driven design -- one loop that
+        checks state and handles events as they arrive -- is simpler
+        and more robust."
+
+   Translate to this chapter: our main loop checks g_running and
+   g_children instead of blocking; the signal handlers only set flags.
+   That is event-driven thinking applied to asynchronous events.
+\end{verbatim}
+
+Why this matters beyond signals: it is the same architecture we will
+use for network servers in Chapter~17, where one loop multiplexes
+thousands of connections. The claim is contested (some argue threads
+scale better), but the pattern is proven and it is what our code uses.
+
+\paperref{J.~Ousterhout, ``Why Threads Are A Bad Idea (for most
+purposes),'' invited talk, USENIX 1996}{https://web.stanford.edu/~ouster/cgi-bin/papers/threads.pdf}
+\end{researchnote}
+
+\section{Structures in Bytes}
+
+A signal is a small integer (1--31 standard, plus 34--64 real-time on
+Linux), so the kernel's per-process signal state is mostly bits. The
+\code{sigset\_t} you pass to \code{sigprocmask} is exactly a bit array:
+
+\begin{verbatim}
+   sigset_t on Linux/x86-64: 128 bytes = 1024 bits, one bit per signal.
+
+   byte:   0        1        2        ...   127
+          +--------+--------+--------+-- --+--------+
+          |        |        |        |     |        |   bit i = signal i+1
+          +--------+--------+--------+-- --+--------+
+          SIGINT (2)  -> bit 1 of byte 0
+          SIGKILL (9) -> bit 8: byte 1, bit 0
+          SIGTERM(15) -> bit 14: byte 1, bit 6
+
+   struct sigaction on glibc/x86-64: 152 bytes
+   offset  size  field
+   0       8     sa_handler      (or sa_sigaction: same storage)
+   8       128   sa_mask         (a sigset_t)
+   136     4     sa_flags        (SA_RESTART, SA_SIGINFO, ...)
+   144     8     sa_restorer     (legacy; you never set it)
+\end{verbatim}
+
+(The exact sizes are an ABI detail; the shape is what matters: one
+pointer, one bit-array, one int, one pointer.) You never touch these
+bytes directly---\code{sigemptyset} and \code{sigaddset} manage the
+bit array, \code{sigaction} fills the struct---but it is useful to
+know that blocking a signal is just setting a bit.
+
+\section{Summary}
+
+\begin{verbatim}
+   The signal model in one picture:
+
+      event ------> GENERATED
+                       |      blocked? yes ----> PENDING (coalesced)
+                       |      blocked? no       | (delivered on unblock)
+                       v                        v
+                  DELIVERED ----> default action or your handler
+                       |
+                       +--- handler may set flags (volatile sig_atomic_t)
+                       +--- handler may call only async-signal-safe fns
+                       +--- slow syscalls return EINTR; retry or SA_RESTART
+
+   The rules that keep signal code correct:
+     1. install with sigaction, not signal;
+     2. handlers set flags; the main loop does the work;
+     3. flags are volatile sig_atomic_t;
+     4. never call malloc/printf in a handler; use write/_exit;
+     5. reap SIGCHLD with a WNOHANG loop;
+     6. wrap slow syscalls against EINTR;
+     7. SIGKILL and SIGSTOP are not yours to catch.
+\end{verbatim}
+
+\begin{osconcept}
+Signals are the oldest asynchronous mechanism in Unix, and they remain
+the OS's primary way of injecting events into running processes. The
+whole chapter is a tour of operating system design: privileged event
+delivery, per-process dispositions, a kernel-side state machine
+(pending/blocked/delivered), an async-safety contract, and the
+interaction of signals with blocking system calls. Master it and you
+can build daemons, supervisors, and servers that behave correctly under
+the chaos of the real machine.
+\end{osconcept}
+
+In the next chapter we give signals a channel: inter-process
+communication through pipes, which let one process pour its output into
+another---the mechanism behind every command pipeline you have ever
+typed.
+

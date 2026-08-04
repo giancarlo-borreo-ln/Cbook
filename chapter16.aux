@@ -1,0 +1,60 @@
+\relax 
+\providecommand\hyper@newdestlabel[2]{}
+\@writefile{toc}{\contentsline {chapter}{\numberline {16}Durable Storage: An Append-Only Log Database}{277}{chapter.16}\protected@file@percent }
+\@writefile{lof}{\addvspace {10\p@ }}
+\@writefile{lot}{\addvspace {10\p@ }}
+\@writefile{toc}{\contentsline {section}{\numberline {16.1}Why Persistence Is Hard}{277}{section.16.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {16.2}The Append-Only Log}{278}{section.16.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {16.3}The Page Cache and fsync}{279}{section.16.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {16.4}The Record Format: Bytes, Not Structs}{280}{section.16.4}\protected@file@percent }
+\@writefile{lol}{\contentsline {lstlisting}{\numberline {16.1}Serialization helpers: ints as bytes, on purpose.}{280}{lstlisting.16.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {16.5}The Write Path: Append and fsync}{282}{section.16.5}\protected@file@percent }
+\@writefile{lol}{\contentsline {lstlisting}{\numberline {16.2}write\_all: loop until every byte is written.}{282}{lstlisting.16.2}\protected@file@percent }
+\@writefile{lol}{\contentsline {lstlisting}{\numberline {16.3}append\_record: one durable record at the tail.}{282}{lstlisting.16.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {16.6}The Read Path: Replay}{284}{section.16.6}\protected@file@percent }
+\@writefile{lol}{\contentsline {lstlisting}{\numberline {16.4}read\_record: read one record, or say why you cannot.}{284}{lstlisting.16.4}\protected@file@percent }
+\@writefile{lol}{\contentsline {lstlisting}{\numberline {16.5}db\_replay: read the clean prefix, apply it.}{285}{lstlisting.16.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {16.7}The In-Memory Index and the API}{286}{section.16.7}\protected@file@percent }
+\@writefile{lol}{\contentsline {lstlisting}{\numberline {16.6}The database: a log plus a hash-table cache.}{286}{lstlisting.16.6}\protected@file@percent }
+\@writefile{lol}{\contentsline {lstlisting}{\numberline {16.7}The API: log first, then cache.}{288}{lstlisting.16.7}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {16.8}Compaction: Shrinking the Log}{289}{section.16.8}\protected@file@percent }
+\@writefile{lol}{\contentsline {lstlisting}{\numberline {16.8}db\_compact: live entries only, then an atomic swap.}{289}{lstlisting.16.8}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {16.9}Practical: The Whole Database}{291}{section.16.9}\protected@file@percent }
+\@writefile{lol}{\contentsline {lstlisting}{\numberline {16.9}dblog.c: opening, closing, and a demo main.}{292}{lstlisting.16.9}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {16.10}Where the Real Databases Go From Here}{294}{section.16.10}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {16.11}Structures in Bytes}{295}{section.16.11}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {16.12}Summary}{296}{section.16.12}\protected@file@percent }
+\@setckpt{chapter16}{
+\setcounter{page}{297}
+\setcounter{equation}{0}
+\setcounter{enumi}{0}
+\setcounter{enumii}{0}
+\setcounter{enumiii}{0}
+\setcounter{enumiv}{0}
+\setcounter{footnote}{0}
+\setcounter{mpfootnote}{0}
+\setcounter{part}{0}
+\setcounter{chapter}{16}
+\setcounter{section}{12}
+\setcounter{subsection}{0}
+\setcounter{subsubsection}{0}
+\setcounter{paragraph}{0}
+\setcounter{subparagraph}{0}
+\setcounter{figure}{0}
+\setcounter{table}{0}
+\setcounter{parentequation}{0}
+\setcounter{lstnumber}{77}
+\setcounter{FancyVerbLine}{19}
+\setcounter{tcbbreakpart}{1}
+\setcounter{tcblayer}{0}
+\setcounter{tcolorbox@number}{316}
+\setcounter{tcbrastercolumn}{1}
+\setcounter{tcbrasterrow}{1}
+\setcounter{tcbrasternum}{1}
+\setcounter{tcbraster}{0}
+\setcounter{section@level}{0}
+\setcounter{Item}{0}
+\setcounter{Hfootnote}{0}
+\setcounter{bookmark@seq@number}{237}
+\setcounter{lstlisting}{9}
+}

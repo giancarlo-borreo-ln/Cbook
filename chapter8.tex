@@ -1,0 +1,808 @@
+% ============================================================================
+%  chapter8.tex
+%  Filesystems in Depth: Metadata, Links, and Directories
+% ============================================================================
+
+\chapter{Filesystems in Depth}
+
+\section{The Filesystem Is a Namespace}
+
+Chapter~5 treated files as ``a sequence of bytes you can read or
+write,'' and that was the right first cut. Now we go one layer deeper:
+a \emph{filesystem} is the kernel's system for \emph{naming,
+organizing, and persisting} those byte sequences. Understanding it
+means answering three questions the earlier chapter deferred: where do
+the bytes physically live, what is a \emph{name}, and what does a
+\emph{directory} really contain?
+
+The three answers, in one picture:
+
+\begin{verbatim}
+   A filesystem has three layers:
+
+     NAMES        a tree of directory entries:   /home/you/data.txt
+        |
+        v
+     INODES       per-file metadata + a map of where the data is:
+                  { type, permissions, size, [block 4][block 9]... }
+        |
+        v
+     BLOCKS       fixed-size chunks of disk (or memory) that hold
+                  the bytes themselves.
+
+   - A NAME is a directory entry: a string in a directory file.
+   - An INODE ("index node") is the kernel's record for ONE file:
+     its type, its permissions, its size, and pointers to its blocks.
+   - A BLOCK is the actual storage, typically 4 KB.
+\end{verbatim}
+
+The term to keep: a filesystem is a \emph{namespace}. The tree of
+paths you type is the interface; behind it sits a machinery of inodes
+and blocks that the kernel maintains and you almost never see. When we
+say ``the file system,'' we mean this whole apparatus---not just the
+directory tree.
+
+\begin{osconcept}
+Persistence and naming are an OS problem for the same reason every
+service so far has been: only the kernel can give programs a
+\emph{shared, protected, persistent} namespace. A library cannot make a
+name survive a reboot; the filesystem does, because the kernel owns
+the storage devices and the mapping from names to blocks. Providing
+that namespace---and keeping it consistent across crashes and
+processes---is one of the oldest responsibilities of an operating
+system.
+\end{osconcept}
+
+\section{stat: Reading the Inode's Record}
+
+The kernel exposes the contents of an inode through the \code{stat}
+system call. It fills a \code{struct stat} with every fact about the
+file that is not its data: its type, its permissions, its size, how
+many hard links point to it, who owns it, and when it was touched.
+
+\begin{lstlisting}[caption={stat: dump the metadata of a path.}]
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
+
+int main(int argc, char *argv[]) {
+    struct stat st;
+    int r;
+
+    if (argc != 2) {
+        fprintf(stderr, "usage: %s path\n", argv[0]);
+        return 1;
+    }
+
+    r = stat(argv[1], &st);
+    if (r < 0) {
+        perror("stat");
+        return 1;
+    }
+
+    printf("size        : %ld bytes\n",  (long) st.st_size);
+    printf("mode        : 0%o (octal)\n", (unsigned) st.st_mode);
+    printf("hard links  : %ld\n",          (long) st.st_nlink);
+    printf("owner       : uid=%d gid=%d\n", (int) st.st_uid, (int) st.st_gid);
+    printf("device      : major=%d minor=%d\n",
+           major(st.st_dev), minor(st.st_dev));
+    printf("blocks      : %ld (x512 bytes)\n", (long) st.st_blocks);
+
+    return 0;
+}
+\end{lstlisting}
+
+\begin{verbatim}
+   What each field is (the inode's record, in plain words):
+
+     st_mode    a bit field packing BOTH the file type and the
+                permissions. Two kinds of info in one integer.
+     st_nlink   how many directory entries name this same inode.
+                A file with no name left has nlink == 0 and is
+                actually deleted (or waiting for its last close).
+     st_size    the length in bytes of the DATA.
+     st_uid, st_gid   who owns it (the numbers behind ls's names).
+     st_mtime   last time the DATA changed.  ("m" = modified)
+     st_ctime   last time the INODE metadata changed. (NOT creation)
+     st_atime   last time it was read.
+     st_blocks  how many 512-byte units of disk it occupies. Compare
+                st_blocks*512 to st_size: a sparse file (ch.5) shows
+                blocks*512 < size, because holes cost nothing.
+
+   st_mode's two halves:
+
+     bits 12-15 : the TYPE      bits 0-11 : the PERMISSIONS
+     0100000 regular (S_IFREG)   0755     = rwx r-x r-x
+     0040000 directory (S_IFDIR)
+     0120000 symbolic link (S_IFLNK)
+\end{verbatim}
+
+The type bits are read through the macros \code{S\_ISREG},
+\code{S\_ISDIR}, \code{S\_ISLNK}, and friends---never by comparing raw
+numbers:
+
+\begin{lstlisting}[caption={The S\_IS* macros decode the type half of st\_mode.}]
+#include <stdio.h>
+#include <sys/stat.h>
+
+const char *type_name(mode_t mode) {
+    if (S_ISREG(mode))  return "regular file";
+    if (S_ISDIR(mode))  return "directory";
+    if (S_ISLNK(mode))  return "symbolic link";
+    if (S_ISCHR(mode))  return "character device";
+    if (S_ISBLK(mode))  return "block device";
+    if (S_ISFIFO(mode)) return "fifo";
+    if (S_ISSOCK(mode)) return "socket";
+    return "unknown";
+}
+\end{lstlisting}
+
+One warning before we go on: there are \emph{two} stat-like calls.
+\code{stat(path, ...)} follows a symbolic link and reports the
+\emph{target's} inode. \code{lstat(path, ...)} reports the link itself.
+The difference matters the moment we walk directories, because a
+directory may contain links we must not chase.
+
+\begin{osconcept}
+An inode is kernel state: one per file, owned by the kernel, updated
+by the kernel (permissions, timestamps, link counts) as the world
+changes around you. \code{stat} is a read-only window into that state.
+Only the kernel can maintain the mapping from names to inodes to
+blocks, so ``what is this file?'' is answered by the OS, not by your
+program.
+\end{osconcept}
+
+\section{File Types}
+
+The type half of \code{st\_mode} distinguishes seven kinds of object,
+and every one of them is ``a file'' in the eyes of the namespace.
+This is the design decision of Chapter~5 paying off: a uniform
+interface over wildly different objects.
+
+\begin{verbatim}
+   the seven types, as the first character of `ls -l`:
+
+     -  regular file     bytes of data (the kind you usually mean)
+     d  directory        a file whose bytes ARE directory entries
+     l  symbolic link    a file whose bytes are a target path
+     c  character device a device that transfers bytes one at a time
+                          (terminals, /dev/null)
+     b  block device     a device that transfers in blocks (disks)
+     p  fifo             a named pipe from Chapter 7
+     s  socket           a network endpoint from Chapter 17
+
+   `ls -l /dev/null` shows:  c...
+   `ls -ld /home`     shows:  d...
+   `ls -l /proc`      shows:  d...  (and inside it, virtual files)
+\end{verbatim}
+
+\begin{verbatim}
+   The surprising consequence:
+
+     A directory is a FILE. Its "data" is a list of names -> inode
+     numbers. `read()` a directory directly is awkward and
+     discouraged, which is why we will use the opendir/readdir API
+     (Section 8.5). But underneath, a directory is just bytes the
+     kernel happens to interpret as entries.
+\end{verbatim}
+
+\begin{osconcept}
+Treating devices, pipes, and directories as file types is the
+\emph{everything is a file} doctrine, and it is an OS design decision
+of enormous power. Because every object in the namespace answers the
+same \code{stat}/\code{open}/\code{read} interface, tools never need
+to know what they are touching. The kernel's job is to translate the
+generic calls into whatever the underlying object actually needs---
+hardware for a device, bytes for a regular file.
+\end{osconcept}
+
+\section{Permissions}
+
+The low 12 bits of \code{st\_mode} describe who may do what. There are
+three classes---user, group, other---and three operations per class---
+read, write, execute. In octal, each class is one digit: 4 for read,
+2 for write, 1 for execute, summed.
+
+\begin{verbatim}
+   mode 0644, drawn bit by bit:
+
+       octal:     0     6       4       4
+             special  u w x   g r w x   o r w x   (class: rwx)
+       bits:  sticky  | | |    | | |    | | |
+                     user     group    other
+       0644 = rw- r-- r--
+
+   The three special bits (not shown here) are setuid, setgid, and
+   the sticky bit -- we mention them only to note they exist.
+
+   mode 0755 (a program): rwx r-x r-x   -- owner may edit, all may run
+   mode 0600 (a secret):  rw- --- ---   -- only the owner
+   mode 0777 (a warning): rwx rwx rwx   -- everyone everything
+\end{verbatim}
+
+The kernel enforces these on every \code{open}: it compares the
+requester's uid/gid against the file's owner and group, picks the
+matching class, and checks the appropriate bits. This check happens
+\emph{in the kernel}, at \code{open} time, once---which is why a file
+can be opened and then its permissions changed without breaking the
+already-open descriptor.
+
+\begin{verbatim}
+   Where the bits are consulted, and who changes them:
+
+     open("f", O_RDONLY)   -> kernel checks read bits for your class
+     open("f", O_WRONLY)   -> kernel checks write bits
+     chmod("f", 0600)      -> you change the bits (if you own it)
+     umask(022)            -> your process asks the kernel to mask
+                              off bits from every new file's mode
+
+   The umask explains a common mystery: you open() with mode 0666 and
+   get 0644. The kernel ANDed your mode with ~umask (022) at open
+   time. The kernel, not the library, owns this masking.
+\end{verbatim}
+
+\begin{lstlisting}[caption={Decoding permissions bit by bit, like ls does.}]
+#include <stdio.h>
+#include <sys/stat.h>
+
+char file_type_char(mode_t mode) {
+    if (S_ISREG(mode))  return '-';
+    if (S_ISDIR(mode))  return 'd';
+    if (S_ISLNK(mode))  return 'l';
+    if (S_ISCHR(mode))  return 'c';
+    if (S_ISBLK(mode))  return 'b';
+    if (S_ISFIFO(mode)) return 'p';
+    if (S_ISSOCK(mode)) return 's';
+    return '?';
+}
+
+/* Print the 10-character ls -l permissions field. */
+void print_mode_bits(mode_t mode) {
+    const char *rwx = "rwxrwxrwx";
+    int i;
+
+    putchar(file_type_char(mode));
+
+    /* Bit 8 = user read ... bit 0 = other execute. */
+    for (i = 0; i < 9; i++) {
+        int bit;
+
+        bit = 8 - i;
+        if (mode & (1 << bit)) {
+            putchar(rwx[i]);
+        } else {
+            putchar('-');
+        }
+    }
+}
+\end{lstlisting}
+
+\begin{osconcept}
+The permission model is enforced by the kernel because users cannot be
+trusted to enforce it on each other, and because the check must happen
+at the exact moment of every \code{open}. The kernel compares real and
+effective ids, walks the three classes, and refuses---returning
+\code{EACCES}---before any data moves. Making permission checks part of
+the syscall boundary is what makes multi-user sharing safe at all.
+\end{osconcept}
+
+\section{Links: Two Kinds of Indirection}
+
+The \code{st\_nlink} field in our \code{stat} dump is a count of
+\emph{hard links}. Understanding the two kinds of link is the key to
+the inode model, and both kinds come from a single idea: a \emph{name}
+and a \emph{file} are different things, and several names can point at
+one file.
+
+\subsection{Hard Links}
+
+A hard link is a second name for the \emph{same inode}. Creating one
+increments \code{st\_nlink}; deleting one decrements it. The data is
+freed only when the count reaches zero. The two names are perfectly
+equal---there is no ``real'' file and ``link.'' When you create a file,
+\code{st\_nlink} is 1; \code{link()} makes it 2.
+
+\begin{lstlisting}[caption={Creating both kinds of link.}]
+#include <stdio.h>
+#include <unistd.h>
+
+int main(void) {
+    if (link("data.txt", "data_hard.txt") < 0) {
+        perror("link");
+    }
+    if (symlink("data.txt", "data_soft.txt") < 0) {
+        perror("symlink");
+    }
+    return 0;
+}
+\end{lstlisting}
+
+\begin{verbatim}
+   HARD LINK: two directory entries, ONE inode.
+
+   directory                   the single inode (nlink = 2)
+   +--------------------+       +------------------------+
+   | data.txt ----------+------>| type, perms, size,     |
+   | data_hard.txt -----+       | and pointers to the    |
+   +--------------------+       | actual data blocks     |
+                                +------------------------+
+
+   - Both names are the SAME file. Renaming one leaves the other.
+   - Deleting data.txt only decrements nlink to 1; data survives.
+   - Hard links CANNOT cross filesystems (they are inode numbers,
+     and inode numbers are only meaningful within one filesystem),
+     and cannot point at a directory.
+\end{verbatim}
+
+\subsection{Symbolic Links}
+
+A symbolic link (symlink) is a different beast: a tiny file whose
+\emph{content is a path string}. It is a pointer in the namespace, not
+a second name for an inode. The kernel resolves the path whenever you
+open through it. That is why a symlink \emph{can} cross filesystems,
+\emph{can} point at a directory, and \emph{dangles} when its target
+vanishes.
+
+\begin{verbatim}
+   SYMBOLIC LINK: a name containing a path.
+
+   directory                       inodes
+   +--------------------+       +------------------------+
+   | data.txt ----------+------>| inode for data.txt     |
+   | data_soft.txt -----+       +------------------------+
+   +--------------------+             ^
+        "data_soft.txt" is a file whose bytes are the STRING
+        "data.txt". Opening it makes the kernel open data.txt.
+
+   - stat()  follows the link (reports the target).
+   - lstat() reports the link itself.
+   - Rename or delete data.txt, and data_soft.txt still "exists"
+     but resolves to nothing: a dangling link.
+\end{verbatim}
+
+\begin{osconcept}
+Links are kernel bookkeeping about the namespace. A hard link is a
+reference count on an inode; a symlink is a small file containing a
+path. Only the kernel can maintain the inode table, resolve paths,
+and decide when a file's data may finally be reclaimed. The \emph{nlink}
+count in \code{stat} is literally a kernel-owned counter that your
+program can only read.
+\end{osconcept}
+
+\section{Directories and Traversal}
+
+A directory is a file whose contents are \emph{directory entries}: a
+list of (name, inode number) pairs. To read it you use the directory
+stream API: \code{opendir} opens a handle, \code{readdir} returns one
+entry at a time, \code{closedir} releases it.
+
+\begin{lstlisting}[caption={Listing a directory, entry by entry.}]
+#include <stdio.h>
+#include <stdlib.h>
+#include <dirent.h>
+
+int list_dir(const char *path) {
+    DIR *d;
+    struct dirent *e;
+
+    d = opendir(path);
+    if (d == NULL) {
+        perror("opendir");
+        return -1;
+    }
+
+    while (1) {
+        e = readdir(d);
+        if (e == NULL) {
+            break;
+        }
+        if (e->d_name[0] == '.') {
+            continue;    /* skip "." and ".." (and dotfiles here) */
+        }
+        printf("%s\n", e->d_name);
+    }
+
+    closedir(d);
+    return 0;
+}
+\end{lstlisting}
+
+\begin{verbatim}
+   What readdir() hands you, one struct per entry:
+
+     struct dirent {
+         char d_name[256];   the entry's name
+         ...                 (the inode number, and a type hint that
+                              MAY be present -- never rely on it)
+     };
+
+   - Every directory contains "." (itself) and ".." (its parent);
+     real listings skip them.
+   - readdir gives you only NAMES. To get size/permissions you must
+     stat() each one -- that is exactly why `ls -l` reads the whole
+     directory AND stats every entry.
+   - The order of entries is not meaningful and not sorted.
+\end{verbatim}
+
+Recursing into subdirectories turns a lister into a tree walker, and
+that is where \code{lstat} becomes essential: using \code{stat} here
+would follow symlinks and could loop forever on a link that points at
+an ancestor.
+
+\begin{lstlisting}[caption={walk.c: a recursive tree walker, using lstat.}]
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <dirent.h>
+#include <sys/stat.h>
+
+/* Recursively print every entry under base, indented by depth. */
+void walk(const char *base, int depth) {
+    DIR *d;
+    struct dirent *e;
+    int i;
+
+    d = opendir(base);
+    if (d == NULL) {
+        return;
+    }
+
+    while (1) {
+        struct stat st;
+        char path[1024];
+        int plen;
+
+        e = readdir(d);
+        if (e == NULL) {
+            break;
+        }
+        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) {
+            continue;
+        }
+
+        plen = snprintf(path, sizeof(path), "%s/%s", base, e->d_name);
+        if (plen < 0 || plen >= (int) sizeof(path)) {
+            continue;          /* name too long; skip this entry */
+        }
+
+        /* lstat, not stat: a symlink must be reported AS a link. */
+        if (lstat(path, &st) < 0) {
+            continue;
+        }
+
+        for (i = 0; i < depth; i++) {
+            printf("  ");
+        }
+        printf("%s\n", e->d_name);
+
+        if (S_ISDIR(st.st_mode)) {
+            walk(path, depth + 1);
+        }
+    }
+
+    closedir(d);
+}
+
+int main(int argc, char *argv[]) {
+    const char *root;
+
+    root = (argc >= 2) ? argv[1] : ".";
+    walk(root, 0);
+    return 0;
+}
+\end{lstlisting}
+
+\begin{verbatim}
+   Output shape for a small tree:
+
+     .
+       src
+         main.c
+         util.c
+       README.md
+       build.sh
+
+   Every level is an opendir/readdir/closedir cycle; every entry is
+   lstat()ed. That is precisely the loop `find` and `du` run.
+\end{verbatim}
+
+\begin{osconcept}
+Directory traversal is kernel-managed iteration. The directory is a
+file whose format the kernel owns, so user code reads it only through
+the kernel's \code{readdir} interface---never by guessing at bytes.
+The \code{lstat}-vs-\code{stat} distinction exists because the kernel
+must honor your choice of whether to follow a link, and getting that
+choice wrong (as \code{stat} does in a walker) is how infinite
+recursion and path loops enter a program.
+\end{osconcept}
+
+\section{/proc: The Virtual Filesystem}
+
+\textbf{Concept:} a \emph{virtual filesystem} is a filesystem whose
+``files'' are not stored anywhere---their contents are \emph{generated
+on the fly} by the kernel when you read them. Linux's \code{/proc} is
+the canonical example. Every running process has a directory
+\code{/proc/<pid>} full of files describing it, manufactured from
+kernel data structures the moment you open them.
+
+\begin{verbatim}
+   /proc is not a disk. It is a window into the kernel:
+
+     /proc/self/status     the calling process's state (parent,
+                           threads, memory, ...)
+     /proc/self/cmdline    the command line that started it
+     /proc/self/fd/        a directory of its open descriptors
+     /proc/<pid>/fd/       the same, for any other process
+     /proc/meminfo         whole-system memory numbers
+     /proc/cpuinfo         what the CPUs are
+     /proc/net/tcp         the kernel's TCP connection table
+
+   Reading them is just read(): the bytes are composed on demand.
+   They answer the OS questions of Chapters 4-6 from inside a C
+   program -- without signals, pipes, or privilege tricks.
+\end{verbatim}
+
+\begin{lstlisting}[caption={Reading the kernel through a virtual file.}]
+#include <stdio.h>
+#include <stdlib.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+int main(void) {
+    int fd;
+    char buf[512];
+    ssize_t got;
+
+    fd = open("/proc/self/status", O_RDONLY);
+    if (fd < 0) {
+        perror("open");
+        return 1;
+    }
+
+    got = read(fd, buf, sizeof(buf) - 1);
+    if (got < 0) {
+        perror("read");
+        return 1;
+    }
+    buf[got] = '\0';
+    printf("%s\n", buf);
+
+    close(fd);
+    return 0;
+}
+\end{lstlisting}
+
+The output is ordinary text (its first lines name the pid and parent,
+the thread count, and the memory sizes). Reading it is nothing but the
+Chapter~5 \code{open}/\code{read}/\code{close} pattern applied to a
+file that the kernel creates from its own tables---which is why
+\code{/proc} is a wonderful teaching tool and a beloved debugging
+instrument for systems programmers.
+
+\begin{osconcept}
+\code{/proc} shows the kernel \emph{reusing the file abstraction for
+introspection}. The same namespace machinery, inodes, and read path
+now serve as a read-only API to kernel state. This is an OS design
+choice: rather than inventing a new interface for ``ask the kernel
+about itself,'' Linux made the kernel a filesystem. It only works
+because the file abstraction is general enough to serve both disks and
+data structures.
+\end{osconcept}
+
+\begin{researchnote}[The paper that made filesystems fast]
+The metadata and layout story of this chapter has a famous ancestor.
+In 1984, Marshall Kirk McKusick and colleagues at Berkeley published
+``A Fast File System for UNIX,'' describing the redesign of the
+original Unix filesystem. Its innovations are precisely the ideas we
+have been handling all chapter: separating inode metadata from data
+blocks, grouping related blocks for sequential reads, and laying out
+data to minimize disk seeks.
+
+\begin{verbatim}
+   The paper's central design principle (condensed):
+
+       "The file system is organized to keep the disk head moving
+        in the right direction: data for one file is placed in
+        contiguous block groups, and the inode for a file sits near
+        its data."
+
+   In our chapter's terms: st_blocks, inode-vs-data separation, and
+   the reason `ls -l` can be fast are all consequences of this layout
+   design. The 4 KB block size used throughout this book descends
+   directly from this paper's block-group scheme.
+\end{verbatim}
+
+Why read it: it is the clearest demonstration that a filesystem is a
+\emph{performance-and-durability} design as much as a namespace, and
+that the questions we still answer today (block size, metadata
+placement, crash consistency) were first posed in this paper.
+
+\paperref{M.~K.~McKusick, W.~N.~Joy, S.~J.~Leffler, R.~S.~Fabry, ``A Fast
+File System for UNIX,'' ACM Transactions on Computer Systems 2(3),
+1984}{https://www.cs.utexas.edu/~dahlin/classes/cs375/papers/fast-ffs.pdf}
+\end{researchnote}
+
+\section{Practical: A Mini ls -l}
+
+Let us combine \code{opendir}, \code{lstat}, and our permission
+decoder into a genuine tool: a small \code{ls -l} that lists a
+directory with type, permissions, link count, size, and name---the
+output you have read a thousand times, now understood byte by byte.
+
+\begin{lstlisting}[caption={minils.c: a real directory listing tool.}]
+#include <stdio.h>
+#include <stdlib.h>
+#include <dirent.h>
+#include <sys/stat.h>
+
+char file_type_char(mode_t mode) {
+    if (S_ISREG(mode))  return '-';
+    if (S_ISDIR(mode))  return 'd';
+    if (S_ISLNK(mode))  return 'l';
+    if (S_ISCHR(mode))  return 'c';
+    if (S_ISBLK(mode))  return 'b';
+    if (S_ISFIFO(mode)) return 'p';
+    if (S_ISSOCK(mode)) return 's';
+    return '?';
+}
+
+void print_permissions(mode_t mode) {
+    const char *rwx = "rwxrwxrwx";
+    int i;
+
+    putchar(file_type_char(mode));
+    for (i = 0; i < 9; i++) {
+        int bit;
+
+        bit = 8 - i;
+        if (mode & (1 << bit)) {
+            putchar(rwx[i]);
+        } else {
+            putchar('-');
+        }
+    }
+}
+
+int main(int argc, char *argv[]) {
+    const char *path;
+    DIR *d;
+    struct dirent *e;
+
+    path = (argc >= 2) ? argv[1] : ".";
+
+    d = opendir(path);
+    if (d == NULL) {
+        perror("opendir");
+        return 1;
+    }
+
+    while (1) {
+        struct stat st;
+        char full[1024];
+        int plen;
+
+        e = readdir(d);
+        if (e == NULL) {
+            break;
+        }
+        if (e->d_name[0] == '.') {
+            continue;
+        }
+
+        plen = snprintf(full, sizeof(full), "%s/%s", path, e->d_name);
+        if (plen < 0 || plen >= (int) sizeof(full)) {
+            continue;
+        }
+
+        if (lstat(full, &st) < 0) {
+            continue;
+        }
+
+        print_permissions(st.st_mode);
+        printf(" %2ld %8ld %s\n",
+               (long) st.st_nlink,
+               (long) st.st_size,
+               e->d_name);
+    }
+
+    closedir(d);
+    return 0;
+}
+\end{lstlisting}
+
+\begin{verbatim}
+   $ ./minils src
+   -rw-r--r--  1     142 main.c
+   -rw-r--r--  1      89 util.c
+
+   You are now reading those ten characters and three columns the way
+   the kernel writes them: type bits, permission bits, a reference
+   count, and a size from the inode -- fetched by lstat per entry.
+\end{verbatim}
+
+\section{Structures in Bytes}
+
+The inode record that \code{stat} reads is a byte structure. On
+x86-64 glibc, \code{struct stat} is 144 bytes; the fields this chapter
+used sit at these offsets:
+
+\begin{verbatim}
+   struct stat (x86-64 glibc), the fields you met:
+
+   offset  size  field        meaning
+   0       8     st_dev       device the file lives on
+   8       8     st_ino       inode number
+   16      8     st_nlink     hard-link count
+   24      4     st_mode      type + permission bits
+   28      4     st_uid       owner
+   32      4     st_gid       group
+   40      8     st_size      length in bytes
+   72      8     st_blocks    x512-byte disk units
+   96      16    st_mtime     data last modified
+   112     16    st_atime     last access
+   128     16    st_ctime     metadata changed (NOT creation)
+\end{verbatim}
+
+The on-disk ext4 inode is 256 bytes and holds the same ideas in
+compact form:
+
+\begin{verbatim}
+   ext4 inode, key offsets:
+
+   offset  size  field
+   0       2     mode
+   2       2     uid
+   4       4     size_lo
+   8       4     atime
+   12      4     ctime
+   16      4     mtime
+   24      2     gid
+   26      2     links_count      (st_nlink's source)
+   28      4     blocks_lo
+   40      60    block[15]        the map to data blocks
+   106     2     size_high        (size above 4 GB)
+\end{verbatim}
+
+And a directory entry is bytes too: 4 bytes of inode number, 2 of name
+length, 1 type byte, then the name. The kernel parses these records;
+\code{readdir} hands you the pieces, and \code{ls -l} reads the rest
+from the 144-byte \code{stat} record above.
+
+\section{Summary}
+
+\begin{verbatim}
+   The filesystem in one paragraph:
+
+   names (directory entries) -> inodes (metadata + block map) -> blocks
+
+   Tools learned this chapter:
+     stat()/lstat()    read an inode's record
+     S_IS*()           decode the type half of st_mode
+     mode bits         the permission model (rwx, umask, chmod)
+     link()/symlink()  hard vs symbolic indirection
+     opendir/readdir   iterate a directory
+     /proc             the kernel as a virtual filesystem
+
+   Rules:
+     1. lstat when walking directories, stat when you mean the target;
+     2. readdir gives names only -- stat each entry for details;
+     3. nlink==0 means the file's data can be reclaimed;
+     4. permissions are enforced at open() time by the kernel.
+\end{verbatim}
+
+\begin{osconcept}
+Everything in this chapter was the OS maintaining a namespace: inodes,
+reference counts, permission checks, virtual files, and directory
+iteration are all kernel-managed state behind the paths you type. The
+filesystem is where the OS's oldest promise lives---``your data will
+survive, named, and protected''---and understanding its internals is
+what lets you build databases, editors, and tools that treat storage
+as a real resource instead of magic.
+\end{osconcept}
+
+We now have files and the metadata around them. In the next chapter we
+turn back to processes for their other half: how they are grouped and
+supervised---process groups, sessions, and the discipline of writing
+daemons that run forever without a terminal.
+

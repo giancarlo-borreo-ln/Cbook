@@ -1,0 +1,250 @@
+\contentsline {chapter}{\numberline {1}The Foundations of Memory and Pointers}{1}{chapter.1}%
+\contentsline {section}{\numberline {1.1}The Machine Underneath}{1}{section.1.1}%
+\contentsline {subsection}{\numberline {1.1.1}Bits, Bytes, and Words}{2}{subsection.1.1.1}%
+\contentsline {subsection}{\numberline {1.1.2}Registers, Cache, and RAM: The Memory Hierarchy}{3}{subsection.1.1.2}%
+\contentsline {section}{\numberline {1.2}Sizes of the Primitive Types}{4}{section.1.2}%
+\contentsline {section}{\numberline {1.3}The Address Space of a Process}{5}{section.1.3}%
+\contentsline {subsection}{\numberline {1.3.1}Virtual Memory and Pages}{6}{subsection.1.3.1}%
+\contentsline {section}{\numberline {1.4}Addresses and Pointers}{7}{section.1.4}%
+\contentsline {section}{\numberline {1.5}Dereferencing Is Reading or Writing Through an Arrow}{8}{section.1.5}%
+\contentsline {section}{\numberline {1.6}Pointer Arithmetic}{9}{section.1.6}%
+\contentsline {section}{\numberline {1.7}Arrays Are Contiguous Bytes; Pointers Point at Elements}{10}{section.1.7}%
+\contentsline {section}{\numberline {1.8}Stack vs.\ Heap: Who Owns the Memory?}{11}{section.1.8}%
+\contentsline {subsection}{\numberline {1.8.1}The Stack}{11}{subsection.1.8.1}%
+\contentsline {subsection}{\numberline {1.8.2}The Heap}{12}{subsection.1.8.2}%
+\contentsline {section}{\numberline {1.9}Pointers to Pointers}{13}{section.1.9}%
+\contentsline {section}{\numberline {1.10}NULL: The Pointer That Points at Nothing}{14}{section.1.10}%
+\contentsline {section}{\numberline {1.11}Undefined Behavior: The Abyss}{14}{section.1.11}%
+\contentsline {section}{\numberline {1.12}Command-Line Arguments: argc and argv}{15}{section.1.12}%
+\contentsline {section}{\numberline {1.13}Practical Exercise: A Memory Inspector}{16}{section.1.13}%
+\contentsline {section}{\numberline {1.14}Structures in Bytes}{18}{section.1.14}%
+\contentsline {section}{\numberline {1.15}Summary of the Mental Model}{18}{section.1.15}%
+\contentsline {chapter}{\numberline {2}Registers: The Bistable Heart of the Machine}{20}{chapter.2}%
+\contentsline {section}{\numberline {2.1}A Snapshot of the Whole Machine}{20}{section.2.1}%
+\contentsline {section}{\numberline {2.2}The Register: One Word, Sixty-Four Flip-Flops}{21}{section.2.2}%
+\contentsline {section}{\numberline {2.3}Down One Level: The Flip-Flop}{22}{section.2.3}%
+\contentsline {section}{\numberline {2.4}Why the Loop Holds: Bistability and the Math of Feedback}{23}{section.2.4}%
+\contentsline {section}{\numberline {2.5}The Clock: Making a Million Flip-Flops Agree}{24}{section.2.5}%
+\contentsline {subsection}{\numberline {2.5.1}Setup and Hold: The Flip-Flop's Polite Window}{24}{subsection.2.5.1}%
+\contentsline {subsection}{\numberline {2.5.2}Metastability in the Wild: Crossing Asynchronous Borders}{25}{subsection.2.5.2}%
+\contentsline {section}{\numberline {2.6}Down Another Level: Transistors and Capacitors}{26}{section.2.6}%
+\contentsline {section}{\numberline {2.7}The Bottom: Chemistry, Silicon, and a Handful of Electrons}{28}{section.2.7}%
+\contentsline {section}{\numberline {2.8}Back Up: The Image, Understood}{29}{section.2.8}%
+\contentsline {section}{\numberline {2.9}Registers at Work: The Datapath and the ALU}{29}{section.2.9}%
+\contentsline {section}{\numberline {2.10}RFLAGS, Bit by Bit: How a Comparison Decides a Branch}{31}{section.2.10}%
+\contentsline {section}{\numberline {2.11}Practical Exercise: See Your Program's Register Image}{32}{section.2.11}%
+\contentsline {subsection}{\numberline {2.11.1}Dumping the image with gdb}{32}{subsection.2.11.1}%
+\contentsline {subsection}{\numberline {2.11.2}Following your data through the compiler}{33}{subsection.2.11.2}%
+\contentsline {subsection}{\numberline {2.11.3}What to do when registers are not enough}{34}{subsection.2.11.3}%
+\contentsline {section}{\numberline {2.12}Structures in Bytes}{34}{section.2.12}%
+\contentsline {section}{\numberline {2.13}Summary}{36}{section.2.13}%
+\contentsline {chapter}{\numberline {3}Building Abstractions with Structs}{38}{chapter.3}%
+\contentsline {section}{\numberline {3.1}From Scalars to Records}{38}{section.3.1}%
+\contentsline {section}{\numberline {3.2}Declaring and Using a Struct}{38}{section.3.2}%
+\contentsline {subsection}{\numberline {3.2.1}typedef: Giving the Struct a Short Name}{38}{subsection.3.2.1}%
+\contentsline {section}{\numberline {3.3}Memory Layout of a Struct}{39}{section.3.3}%
+\contentsline {section}{\numberline {3.4}Data Alignment: Why the CPU Demands It}{40}{section.3.4}%
+\contentsline {section}{\numberline {3.5}Padding: The Hidden Bytes}{41}{section.3.5}%
+\contentsline {section}{\numberline {3.6}Field Ordering to Shrink Structs}{42}{section.3.6}%
+\contentsline {section}{\numberline {3.7}offsetof and sizeof}{43}{section.3.7}%
+\contentsline {section}{\numberline {3.8}Structs and Pointers: The Arrow Operator}{44}{section.3.8}%
+\contentsline {section}{\numberline {3.9}const Correctness with Structs}{45}{section.3.9}%
+\contentsline {section}{\numberline {3.10}Structs on the Heap}{46}{section.3.10}%
+\contentsline {section}{\numberline {3.11}Nested Structs}{47}{section.3.11}%
+\contentsline {section}{\numberline {3.12}Flexible Array Members: The Variable-Length Tail}{47}{section.3.12}%
+\contentsline {section}{\numberline {3.13}Self-Referential Structures}{49}{section.3.13}%
+\contentsline {section}{\numberline {3.14}Copying and Returning Structs}{49}{section.3.14}%
+\contentsline {section}{\numberline {3.15}Array of Structs vs.\ Struct of Arrays}{50}{section.3.15}%
+\contentsline {section}{\numberline {3.16}Bit Fields: Squeezing Flags into Bytes}{51}{section.3.16}%
+\contentsline {section}{\numberline {3.17}Unions: Overlapping Storage}{52}{section.3.17}%
+\contentsline {section}{\numberline {3.18}Practical Exercise: A Person Registry}{53}{section.3.18}%
+\contentsline {section}{\numberline {3.19}Structures in Bytes}{55}{section.3.19}%
+\contentsline {section}{\numberline {3.20}Summary}{56}{section.3.20}%
+\contentsline {chapter}{\numberline {4}Data Structures and Algorithms in C}{57}{chapter.4}%
+\contentsline {section}{\numberline {4.1}Welcome to the Menagerie}{57}{section.4.1}%
+\contentsline {section}{\numberline {4.2}Linked Lists}{57}{section.4.2}%
+\contentsline {subsection}{\numberline {4.2.1}The Singly Linked List}{57}{subsection.4.2.1}%
+\contentsline {subsection}{\numberline {4.2.2}The Doubly Linked List}{60}{subsection.4.2.2}%
+\contentsline {subsection}{\numberline {4.2.3}The Circular Linked List}{62}{subsection.4.2.3}%
+\contentsline {subsection}{\numberline {4.2.4}The Intrusive Linked List}{64}{subsection.4.2.4}%
+\contentsline {subsection}{\numberline {4.2.5}The Unrolled Linked List}{67}{subsection.4.2.5}%
+\contentsline {subsection}{\numberline {4.2.6}The XOR Linked List}{69}{subsection.4.2.6}%
+\contentsline {section}{\numberline {4.3}The Skip List}{71}{section.4.3}%
+\contentsline {section}{\numberline {4.4}Hash Tables}{75}{section.4.4}%
+\contentsline {subsection}{\numberline {4.4.1}Separate Chaining}{76}{subsection.4.4.1}%
+\contentsline {subsection}{\numberline {4.4.2}Open Addressing}{79}{subsection.4.4.2}%
+\contentsline {section}{\numberline {4.5}Trees}{83}{section.4.5}%
+\contentsline {subsection}{\numberline {4.5.1}The General (N-ary) Tree}{83}{subsection.4.5.1}%
+\contentsline {subsection}{\numberline {4.5.2}Binary Trees and Binary Search Trees}{85}{subsection.4.5.2}%
+\contentsline {subsection}{\numberline {4.5.3}B-Trees}{88}{subsection.4.5.3}%
+\contentsline {subsection}{\numberline {4.5.4}B+ Trees}{91}{subsection.4.5.4}%
+\contentsline {subsection}{\numberline {4.5.5}B* Trees}{92}{subsection.4.5.5}%
+\contentsline {section}{\numberline {4.6}Graphs}{93}{section.4.6}%
+\contentsline {subsection}{\numberline {4.6.1}Graphs as Structs and Arrows}{93}{subsection.4.6.1}%
+\contentsline {subsection}{\numberline {4.6.2}Adjacency List}{94}{subsection.4.6.2}%
+\contentsline {subsection}{\numberline {4.6.3}Adjacency Matrix}{96}{subsection.4.6.3}%
+\contentsline {subsection}{\numberline {4.6.4}DAGs and Topological Order}{97}{subsection.4.6.4}%
+\contentsline {subsection}{\numberline {4.6.5}Traversal: DFS and BFS}{99}{subsection.4.6.5}%
+\contentsline {section}{\numberline {4.7}Structures in Bytes}{101}{section.4.7}%
+\contentsline {section}{\numberline {4.8}Summary of the Menagerie}{102}{section.4.8}%
+\contentsline {chapter}{\numberline {5}System Calls, File I/O, and Process Creation}{103}{chapter.5}%
+\contentsline {section}{\numberline {5.1}The Operating System Is a Service Provider}{103}{section.5.1}%
+\contentsline {subsection}{\numberline {5.1.1}What the Kernel Is}{104}{subsection.5.1.1}%
+\contentsline {section}{\numberline {5.2}User Mode and Kernel Mode}{104}{section.5.2}%
+\contentsline {section}{\numberline {5.3}System Calls: The Only Door}{105}{section.5.3}%
+\contentsline {section}{\numberline {5.4}Files: The Universal Abstraction}{106}{section.5.4}%
+\contentsline {section}{\numberline {5.5}File Descriptors: Your Handles on the Kernel}{107}{section.5.5}%
+\contentsline {section}{\numberline {5.6}Reading and Writing}{109}{section.5.6}%
+\contentsline {subsection}{\numberline {5.6.1}What Is a Buffer?}{109}{subsection.5.6.1}%
+\contentsline {subsection}{\numberline {5.6.2}The Partial I/O Contract}{110}{subsection.5.6.2}%
+\contentsline {section}{\numberline {5.7}Seeking: Moving the File Position}{112}{section.5.7}%
+\contentsline {section}{\numberline {5.8}errno: The Error Channel}{113}{section.5.8}%
+\contentsline {section}{\numberline {5.9}Standard Streams and Redirection}{114}{section.5.9}%
+\contentsline {section}{\numberline {5.10}Processes: What the OS Schedules}{115}{section.5.10}%
+\contentsline {section}{\numberline {5.11}fork(): The Process Duplication Primitive}{116}{section.5.11}%
+\contentsline {subsection}{\numberline {5.11.1}vfork: The Half-Fork}{118}{subsection.5.11.1}%
+\contentsline {section}{\numberline {5.12}exec(): Replacing the Process Image}{119}{section.5.12}%
+\contentsline {section}{\numberline {5.13}wait() and waitpid(): Reaping Children}{120}{section.5.13}%
+\contentsline {section}{\numberline {5.14}Practical: A Tiny Command Runner}{122}{section.5.14}%
+\contentsline {section}{\numberline {5.15}Structures in Bytes}{123}{section.5.15}%
+\contentsline {section}{\numberline {5.16}Summary}{124}{section.5.16}%
+\contentsline {chapter}{\numberline {6}Signals: Asynchronous Events and Their Handlers}{126}{chapter.6}%
+\contentsline {section}{\numberline {6.1}What Is a Signal?}{126}{section.6.1}%
+\contentsline {section}{\numberline {6.2}The Default Actions}{127}{section.6.2}%
+\contentsline {section}{\numberline {6.3}The Three Dispositions}{127}{section.6.3}%
+\contentsline {section}{\numberline {6.4}Blocking, Pending, and Delivered}{129}{section.6.4}%
+\contentsline {section}{\numberline {6.5}What You May Do in a Handler}{131}{section.6.5}%
+\contentsline {section}{\numberline {6.6}SIGCHLD: Reaping Children Asynchronously}{132}{section.6.6}%
+\contentsline {section}{\numberline {6.7}Sending Signals: kill and raise}{134}{section.6.7}%
+\contentsline {section}{\numberline {6.8}alarm: A Signal in the Future}{135}{section.6.8}%
+\contentsline {section}{\numberline {6.9}EINTR: When a Signal Interrupts a System Call}{137}{section.6.9}%
+\contentsline {section}{\numberline {6.10}Practical: A Graceful Shutdown Server}{138}{section.6.10}%
+\contentsline {section}{\numberline {6.11}Structures in Bytes}{140}{section.6.11}%
+\contentsline {section}{\numberline {6.12}Summary}{141}{section.6.12}%
+\contentsline {chapter}{\numberline {7}Inter-Process Communication: Pipes}{143}{chapter.7}%
+\contentsline {section}{\numberline {7.1}Why Processes Cannot Just Talk}{143}{section.7.1}%
+\contentsline {section}{\numberline {7.2}What a Pipe Is}{143}{section.7.2}%
+\contentsline {section}{\numberline {7.3}The Blocking Contract}{145}{section.7.3}%
+\contentsline {section}{\numberline {7.4}fork + pipe: Wiring Two Processes Together}{146}{section.7.4}%
+\contentsline {section}{\numberline {7.5}The EOF Rule}{148}{section.7.5}%
+\contentsline {section}{\numberline {7.6}Pipelines: cmd1 | cmd2}{148}{section.7.6}%
+\contentsline {section}{\numberline {7.7}SIGPIPE: When the Channel Dies}{151}{section.7.7}%
+\contentsline {section}{\numberline {7.8}Named Pipes (FIFOs)}{152}{section.7.8}%
+\contentsline {section}{\numberline {7.9}The IPC Menu}{154}{section.7.9}%
+\contentsline {section}{\numberline {7.10}Practical: A Two-Stage Filter Shell}{155}{section.7.10}%
+\contentsline {section}{\numberline {7.11}Structures in Bytes}{158}{section.7.11}%
+\contentsline {section}{\numberline {7.12}Summary}{159}{section.7.12}%
+\contentsline {chapter}{\numberline {8}Filesystems in Depth}{160}{chapter.8}%
+\contentsline {section}{\numberline {8.1}The Filesystem Is a Namespace}{160}{section.8.1}%
+\contentsline {section}{\numberline {8.2}stat: Reading the Inode's Record}{160}{section.8.2}%
+\contentsline {section}{\numberline {8.3}File Types}{163}{section.8.3}%
+\contentsline {section}{\numberline {8.4}Permissions}{163}{section.8.4}%
+\contentsline {section}{\numberline {8.5}Links: Two Kinds of Indirection}{165}{section.8.5}%
+\contentsline {subsection}{\numberline {8.5.1}Hard Links}{165}{subsection.8.5.1}%
+\contentsline {subsection}{\numberline {8.5.2}Symbolic Links}{166}{subsection.8.5.2}%
+\contentsline {section}{\numberline {8.6}Directories and Traversal}{166}{section.8.6}%
+\contentsline {section}{\numberline {8.7}/proc: The Virtual Filesystem}{169}{section.8.7}%
+\contentsline {section}{\numberline {8.8}Practical: A Mini ls -l}{171}{section.8.8}%
+\contentsline {section}{\numberline {8.9}Structures in Bytes}{173}{section.8.9}%
+\contentsline {section}{\numberline {8.10}Summary}{174}{section.8.10}%
+\contentsline {chapter}{\numberline {9}Process Control and Daemons}{175}{chapter.9}%
+\contentsline {section}{\numberline {9.1}From Single Processes to a Community}{175}{section.9.1}%
+\contentsline {section}{\numberline {9.2}Process Groups}{175}{section.9.2}%
+\contentsline {section}{\numberline {9.3}Sessions and the Controlling Terminal}{177}{section.9.3}%
+\contentsline {section}{\numberline {9.4}setsid: Leaving the Terminal Behind}{178}{section.9.4}%
+\contentsline {section}{\numberline {9.5}Daemons: Processes Without a User}{179}{section.9.5}%
+\contentsline {section}{\numberline {9.6}Resource Limits}{182}{section.9.6}%
+\contentsline {section}{\numberline {9.7}Practical: A Production-Shaped Daemon}{183}{section.9.7}%
+\contentsline {section}{\numberline {9.8}Structures in Bytes}{185}{section.9.8}%
+\contentsline {section}{\numberline {9.9}Summary}{186}{section.9.9}%
+\contentsline {chapter}{\numberline {10}Time, Timers, and I/O Multiplexing}{188}{chapter.10}%
+\contentsline {section}{\numberline {10.1}The Problem: One Process, Many Channels}{188}{section.10.1}%
+\contentsline {section}{\numberline {10.2}Time: The Two Clocks}{189}{section.10.2}%
+\contentsline {section}{\numberline {10.3}Timers}{190}{section.10.3}%
+\contentsline {section}{\numberline {10.4}Non-Blocking I/O}{192}{section.10.4}%
+\contentsline {section}{\numberline {10.5}select: The Classic Multiplexer}{193}{section.10.5}%
+\contentsline {section}{\numberline {10.6}poll: An Array of Interest}{194}{section.10.6}%
+\contentsline {section}{\numberline {10.7}epoll: The Scalable Multiplexer}{196}{section.10.7}%
+\contentsline {section}{\numberline {10.8}The Event Loop: A Reactor}{198}{section.10.8}%
+\contentsline {section}{\numberline {10.9}Practical: A Multi-Channel Event Loop}{198}{section.10.9}%
+\contentsline {section}{\numberline {10.10}Structures in Bytes}{202}{section.10.10}%
+\contentsline {section}{\numberline {10.11}Summary}{203}{section.10.11}%
+\contentsline {chapter}{\numberline {11}Concurrency with Threads}{204}{chapter.11}%
+\contentsline {section}{\numberline {11.1}A Process with Many Simultaneous Selves}{204}{section.11.1}%
+\contentsline {section}{\numberline {11.2}pthread\_create and pthread\_join}{205}{section.11.2}%
+\contentsline {section}{\numberline {11.3}Data Races: The Shared-Variable Problem}{206}{section.11.3}%
+\contentsline {section}{\numberline {11.4}Mutexes: Making a Section Critical}{208}{section.11.4}%
+\contentsline {section}{\numberline {11.5}Condition Variables: Waiting for a Condition}{210}{section.11.5}%
+\contentsline {section}{\numberline {11.6}Deadlock: The Lock You Will Never Get}{212}{section.11.6}%
+\contentsline {section}{\numberline {11.7}Threads vs Processes: Which One}{213}{section.11.7}%
+\contentsline {section}{\numberline {11.8}Practical: A Parallel Sum}{213}{section.11.8}%
+\contentsline {section}{\numberline {11.9}Structures in Bytes}{216}{section.11.9}%
+\contentsline {section}{\numberline {11.10}Summary}{216}{section.11.10}%
+\contentsline {chapter}{\numberline {12}Shared Memory and Memory Mapping}{218}{chapter.12}%
+\contentsline {section}{\numberline {12.1}The Boldest Abstraction: Memory That Is a File}{218}{section.12.1}%
+\contentsline {section}{\numberline {12.2}mmap: The Call}{219}{section.12.2}%
+\contentsline {section}{\numberline {12.3}Anonymous Mappings}{220}{section.12.3}%
+\contentsline {section}{\numberline {12.4}MAP\_SHARED vs MAP\_PRIVATE}{222}{section.12.4}%
+\contentsline {section}{\numberline {12.5}Synchronizing Shared Memory}{223}{section.12.5}%
+\contentsline {section}{\numberline {12.6}Practical: Editing a File Through a Mapping}{225}{section.12.6}%
+\contentsline {section}{\numberline {12.7}Structures in Bytes}{227}{section.12.7}%
+\contentsline {section}{\numberline {12.8}Summary}{228}{section.12.8}%
+\contentsline {chapter}{\numberline {13}Advanced Memory Management and Custom Allocators}{230}{chapter.13}%
+\contentsline {section}{\numberline {13.1}The Problem malloc Solves}{230}{section.13.1}%
+\contentsline {section}{\numberline {13.2}Free Lists and the Split/Merge Dance}{230}{section.13.2}%
+\contentsline {section}{\numberline {13.3}Fragmentation: The Silent Tax}{233}{section.13.3}%
+\contentsline {section}{\numberline {13.4}Arenas and Object Pools}{237}{section.13.4}%
+\contentsline {section}{\numberline {13.5}Practical: A Connection Pool for a Server}{240}{section.13.5}%
+\contentsline {section}{\numberline {13.6}Structures in Bytes}{243}{section.13.6}%
+\contentsline {section}{\numberline {13.7}Summary}{243}{section.13.7}%
+\contentsline {chapter}{\numberline {14}Text Parsing and State Machines}{245}{chapter.14}%
+\contentsline {section}{\numberline {14.1}Why Parsing Is a Systems Skill}{245}{section.14.1}%
+\contentsline {section}{\numberline {14.2}Tokens and the Token Stream}{245}{section.14.2}%
+\contentsline {section}{\numberline {14.3}The Lexer as a State Machine}{247}{section.14.3}%
+\contentsline {section}{\numberline {14.4}The Parser: Validating the Token Stream}{250}{section.14.4}%
+\contentsline {section}{\numberline {14.5}The REPL: Read, Gate, Execute}{254}{section.14.5}%
+\contentsline {subsection}{\numberline {14.5.1}What a REPL Is}{254}{subsection.14.5.1}%
+\contentsline {subsection}{\numberline {14.5.2}REPL Gating: Every Stage Guards the Next}{255}{subsection.14.5.2}%
+\contentsline {section}{\numberline {14.6}The Complete Journey: ``INSERT 42 100''}{257}{section.14.6}%
+\contentsline {section}{\numberline {14.7}Layering: The Tree Never Learns the Language}{259}{section.14.7}%
+\contentsline {section}{\numberline {14.8}Structures in Bytes}{260}{section.14.8}%
+\contentsline {section}{\numberline {14.9}Summary}{261}{section.14.9}%
+\contentsline {chapter}{\numberline {15}The Linux Filesystem Hierarchy}{262}{chapter.15}%
+\contentsline {section}{\numberline {15.1}The One Tree}{262}{section.15.1}%
+\contentsline {section}{\numberline {15.2}The Story of the Tree}{263}{section.15.2}%
+\contentsline {section}{\numberline {15.3}The OS Concept: Mount Points and the Root Filesystem}{264}{section.15.3}%
+\contentsline {section}{\numberline {15.4}The Directories, One by One}{266}{section.15.4}%
+\contentsline {subsection}{\numberline {15.4.1}The Core}{267}{subsection.15.4.1}%
+\contentsline {subsection}{\numberline {15.4.2}Users and Data}{268}{subsection.15.4.2}%
+\contentsline {subsection}{\numberline {15.4.3}The System Proper}{269}{subsection.15.4.3}%
+\contentsline {subsection}{\numberline {15.4.4}Virtual Filesystems: Two Meanings of ``Virtual''}{269}{subsection.15.4.4}%
+\contentsline {section}{\numberline {15.5}The Problem the Tree Solves}{271}{section.15.5}%
+\contentsline {section}{\numberline {15.6}Practical: A Filesystem Tourist}{272}{section.15.6}%
+\contentsline {section}{\numberline {15.7}Structures in Bytes}{275}{section.15.7}%
+\contentsline {section}{\numberline {15.8}Summary}{276}{section.15.8}%
+\contentsline {chapter}{\numberline {16}Durable Storage: An Append-Only Log Database}{277}{chapter.16}%
+\contentsline {section}{\numberline {16.1}Why Persistence Is Hard}{277}{section.16.1}%
+\contentsline {section}{\numberline {16.2}The Append-Only Log}{278}{section.16.2}%
+\contentsline {section}{\numberline {16.3}The Page Cache and fsync}{279}{section.16.3}%
+\contentsline {section}{\numberline {16.4}The Record Format: Bytes, Not Structs}{280}{section.16.4}%
+\contentsline {section}{\numberline {16.5}The Write Path: Append and fsync}{282}{section.16.5}%
+\contentsline {section}{\numberline {16.6}The Read Path: Replay}{284}{section.16.6}%
+\contentsline {section}{\numberline {16.7}The In-Memory Index and the API}{286}{section.16.7}%
+\contentsline {section}{\numberline {16.8}Compaction: Shrinking the Log}{289}{section.16.8}%
+\contentsline {section}{\numberline {16.9}Practical: The Whole Database}{291}{section.16.9}%
+\contentsline {section}{\numberline {16.10}Where the Real Databases Go From Here}{294}{section.16.10}%
+\contentsline {section}{\numberline {16.11}Structures in Bytes}{295}{section.16.11}%
+\contentsline {section}{\numberline {16.12}Summary}{296}{section.16.12}%
+\contentsline {chapter}{\numberline {17}Network Programming}{297}{chapter.17}%
+\contentsline {section}{\numberline {17.1}Beyond One Machine}{297}{section.17.1}%
+\contentsline {section}{\numberline {17.2}The Three Names of a Network Conversation}{297}{section.17.2}%
+\contentsline {section}{\numberline {17.3}Sockets and Byte Order}{298}{section.17.3}%
+\contentsline {section}{\numberline {17.4}A TCP Server, Step by Step}{299}{section.17.4}%
+\contentsline {section}{\numberline {17.5}A TCP Client: The Three-Way Handshake}{302}{section.17.5}%
+\contentsline {subsection}{\numberline {17.5.1}How a Connection Works in Bytes}{303}{subsection.17.5.1}%
+\contentsline {section}{\numberline {17.6}Reading and Writing on a Socket}{305}{section.17.6}%
+\contentsline {section}{\numberline {17.7}TCP vs UDP}{305}{section.17.7}%
+\contentsline {section}{\numberline {17.8}The Scalable Server: One Loop, Many Sockets}{307}{section.17.8}%
+\contentsline {section}{\numberline {17.9}Practical: Growing the Echo Server into a Database}{310}{section.17.9}%
+\contentsline {section}{\numberline {17.10}Structures in Bytes}{312}{section.17.10}%
+\contentsline {section}{\numberline {17.11}Summary}{313}{section.17.11}%
